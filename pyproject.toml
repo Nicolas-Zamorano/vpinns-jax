@@ -20,3 +20,8 @@ build-backend = "uv_build"
 
 [tool.uv.sources]
 jax-fem = { path = "/home/nicolas/Documents/Github/fem-jax", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
