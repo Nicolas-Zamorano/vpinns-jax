@@ -1,13 +1,19 @@
-"""Solvers and adaptive training loop (implementation plan Component 6)."""
+"""
+Training of network trial functions.
+"""
 
-from vpinns_jax.solvers.adaptive_loop import AdaptiveIterationResult, run_adaptive_loop
-from vpinns_jax.solvers.trainer import TrainingHistory, train, train_adam, train_lbfgs
+from vpinns_jax.solvers.trainer import (
+    Monitor,
+    TrainingHistory,
+    train,
+    train_adam,
+    train_lbfgs,
+)
 
 __all__ = [
+    "Monitor",
     "TrainingHistory",
     "train_adam",
     "train_lbfgs",
     "train",
-    "AdaptiveIterationResult",
-    "run_adaptive_loop",
 ]

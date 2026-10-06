@@ -1,49 +1,19 @@
-"""Boundary condition imposition for neural trial functions (math reference Section 3).
-
-Two strong-imposition schemes are provided:
-
-- ``ConstrainedAnsatz``: strong imposition *through the network ansatz*,
-  ``u_theta^g = B * u_theta + gbar``, ``B|_Gamma = 0``, ``gbar|_Gamma = g``.
-  Used with the **direct** trial representation ``w_theta = u_theta^g``.
-- ``precompute_interpolation_data`` / ``interpolated_trial_dofs``: strong
-  imposition *on the interpolant*, ``w_theta = Pi_h u_theta = sum_{i in
-  interior} u_theta(x_i) phi_i + sum_{i in Gamma} g(x_i) phi_i``. Used with
-  the **interpolated** trial representation ``w_theta = Pi_h u_theta``.
-
-``precompute_interpolation_data`` is split from ``interpolated_trial_dofs``
-because ``FiniteElementSpace``/``EllipticProblem`` are plain dataclasses, not
-registered JAX pytrees: they cannot be passed into a ``jax.jit``/
-``eqx.filter_jit``-wrapped function directly. ``precompute_interpolation_data``
-does the one-time, eager DOF classification; ``interpolated_trial_dofs`` is
-then a pure function of plain arrays, safe to call from inside a jitted
-training step.
+"""
+Strong imposition of Dirichlet conditions on neural trial functions.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import NamedTuple
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax_fem.constraints import evaluate_dirichlet_dof_values
 from jax_fem.function import FiniteElementFunction
-from jax_fem.space import FiniteElementSpace
 
-from vpinns_jax.pde.base import EllipticPDE
+from vpinns_jax.models.evaluation import Network, evaluate_network_values
+from vpinns_jax.test_spaces.fe_space import FETestSpace
 
-__all__ = [
-    "ExactDistanceFunction",
-    "ConstrainedAnsatz",
-    "InterpolationData",
-    "precompute_interpolation_data",
-    "interpolated_trial_dofs",
-    "interpolated_trial_function",
-]
-
-# Vertices of the re-entrant L-shaped domain [-1,1]^2 \ [0,1]x[-1,0], CCW
-# from the re-entrant corner -- matches jax_fem.mesh.gmsh's own L-shape.
+# Vertices of the L-shaped domain [-1, 1]^2 \ [0, 1] x [-1, 0], counterclockwise
+# from the re-entrant corner, as in jax_fem.mesh.create_gmsh_l_shaped_mesh.
 _L_SHAPE_VERTICES = (
     (0.0, 0.0),
     (1.0, 0.0),
@@ -57,154 +27,197 @@ _GEOMETRIES = ("unit_square", "circle", "l_shape")
 
 
 def _polygon_boundary_distance(x: jax.Array, vertices: jax.Array) -> jax.Array:
-    """Unsigned distance from ``x`` to the boundary of the polygon ``vertices`` (CCW)."""
-    edge_start = vertices
-    edge_end = jnp.roll(vertices, -1, axis=0)
-    edge_vector = edge_end - edge_start
-    edge_length_squared = jnp.sum(edge_vector * edge_vector, axis=-1)
-    projection = jnp.sum((x[None, :] - edge_start) * edge_vector, axis=-1) / (
-        edge_length_squared
+    """
+    Distance from a point to the boundary of a polygon.
+
+    Parameters
+    ----------
+    x : jax.Array
+        Point, shape ``(2,)``.
+    vertices : jax.Array
+        Polygon vertices in order, shape ``(N_vertices, 2)``.
+
+    Returns
+    -------
+    distance : jax.Array
+        Unsigned distance to the nearest edge, shape ``()``.
+    """
+    edge_starts = vertices
+    edges = jnp.roll(vertices, -1, axis=-2) - edge_starts
+    parameters = jnp.sum((x - edge_starts) * edges, axis=-1) / jnp.sum(
+        edges * edges, axis=-1
     )
-    projection = jnp.clip(projection, 0.0, 1.0)
-    closest_point = edge_start + projection[:, None] * edge_vector
-    distances = jnp.linalg.norm(x[None, :] - closest_point, axis=-1)
-    return jnp.min(distances)
+    closest_points = (
+        edge_starts + jnp.expand_dims(jnp.clip(parameters, 0.0, 1.0), axis=-1) * edges
+    )
+    return jnp.min(jnp.linalg.norm(x - closest_points, axis=-1), axis=-1)
 
 
 class ExactDistanceFunction(eqx.Module):
-    """Smooth field ``B(x) >= 0``, ``B|_Gamma = 0``, for standard geometries.
+    """
+    Nonnegative function vanishing exactly on the boundary of a standard domain.
 
-    - ``"unit_square"``: ``B(x, y) = x(1-x) y(1-y)`` -- the classical smooth
-      product distance field for ``[0, 1]^2``.
-    - ``"circle"``: ``B(x) = 1 - |x|^2`` for the unit disk.
-    - ``"l_shape"``: unsigned point-to-polygon-boundary distance for
-      ``[-1,1]^2 \\ [0,1]x[-1,0]`` -- not a smooth closed form (the boundary
-      has corners, including the re-entrant one), but exactly zero on
-      ``Gamma`` and strictly positive in the interior, which is all strong
-      imposition requires.
+    Attributes
+    ----------
+    geometry : str
+        ``"unit_square"``, ``"circle"`` (unit disk), or ``"l_shape"``
+        (``[-1, 1]^2 \\ [0, 1] x [-1, 0]``).
+
+    Notes
+    -----
+    The unit square uses ``x (1 - x) y (1 - y)`` and the unit disk
+    ``1 - |x|^2``, both smooth. The L-shape uses the distance to the polygon
+    boundary, which is only Lipschitz but is zero exactly on the boundary and
+    positive inside, as strong imposition requires.
     """
 
     geometry: str = eqx.field(static=True)
 
-    def __init__(self, geometry: str = "unit_square"):
+    def __init__(self, geometry: str = "unit_square") -> None:
+        """
+        Initialize the distance function.
+
+        Parameters
+        ----------
+        geometry : str
+            One of ``"unit_square"``, ``"circle"``, ``"l_shape"``.
+        """
         if geometry not in _GEOMETRIES:
-            raise ValueError(f"geometry must be one of {_GEOMETRIES}, got {geometry!r}.")
+            raise ValueError(
+                f"geometry must be one of {_GEOMETRIES}, got {geometry!r}."
+            )
         self.geometry = geometry
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """
+        Evaluate the distance function at one point.
+
+        Parameters
+        ----------
+        x : jax.Array
+            Point, shape ``(2,)``.
+
+        Returns
+        -------
+        value : jax.Array
+            Function value, shape ``()``.
+        """
         if self.geometry == "unit_square":
             return x[0] * (1.0 - x[0]) * x[1] * (1.0 - x[1])
         if self.geometry == "circle":
-            return 1.0 - jnp.sum(x * x)
+            return 1.0 - jnp.sum(x * x, axis=-1)
         return _polygon_boundary_distance(x, jnp.asarray(_L_SHAPE_VERTICES))
 
 
-class ConstrainedAnsatz(eqx.Module):
-    r"""Strong Dirichlet imposition through the network ansatz.
-
-    ``u_theta^g(x) = B(x) u_theta(x) + gbar(x)``, ``B|_Gamma = 0``,
-    ``gbar|_Gamma = g`` (math reference Section 3): ``u_theta^g|_Gamma = g``
-    exactly, by construction, for *any* ``u_theta``. Used as the **direct**
-    trial representation ``w_theta = u_theta^g``.
-
-    ``lift`` defaults to the zero function (homogeneous Dirichlet data).
+def _zero_lift(x: jax.Array) -> jax.Array:
     """
+    Zero lift for homogeneous Dirichlet data.
 
-    network: Callable[[jax.Array], jax.Array]
-    distance: Callable[[jax.Array], jax.Array]
-    lift: Callable[[jax.Array], jax.Array]
-
-    def __init__(
-        self,
-        network: Callable[[jax.Array], jax.Array],
-        distance: Callable[[jax.Array], jax.Array],
-        lift: Callable[[jax.Array], jax.Array] | None = None,
-    ):
-        self.network = network
-        self.distance = distance
-        self.lift = lift if lift is not None else (lambda x: jnp.zeros(()))
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.distance(x) * self.network(x) + self.lift(x)
-
-
-class InterpolationData(NamedTuple):
-    """Plain-array DOF classification for ``interpolated_trial_dofs``.
-
-    Precomputed once, eagerly, from a ``FiniteElementSpace``/``EllipticPDE``
-    pair; every field is a JAX array or Python ``int``, safe to pass into a
-    jitted function.
-    """
-
-    dof_coordinates: jax.Array  # (N_dofs, 2)
-    free_dofs: jax.Array  # (N_free,)
-    dirichlet_dofs: jax.Array  # (N_dirichlet,)
-    dirichlet_values: jax.Array  # (N_dirichlet, 1)
-    number_of_dofs: int
-
-
-def precompute_interpolation_data(
-    space: FiniteElementSpace, problem: EllipticPDE
-) -> InterpolationData:
-    """Classify ``space``'s DOFs into free (interior) vs. Dirichlet (boundary).
-
-    Free DOFs are exactly the interior test space's DOF set ``I_int`` (test
-    functions in ``V_h subset H^1_0``); Dirichlet DOFs get ``problem``'s
-    boundary data evaluated at their coordinate.
-    """
-    dirichlet_dofs, dirichlet_values = evaluate_dirichlet_dof_values(problem, space)
-    is_dirichlet = (
-        jnp.zeros((space.number_of_dofs,), dtype=bool).at[dirichlet_dofs].set(True)
-    )
-    free_dofs = jnp.nonzero(~is_dirichlet)[0]
-    dof_coordinates = space.dof_coordinates[:, 0, :]
-    return InterpolationData(
-        dof_coordinates=dof_coordinates,
-        free_dofs=free_dofs,
-        dirichlet_dofs=dirichlet_dofs,
-        dirichlet_values=dirichlet_values,
-        number_of_dofs=space.number_of_dofs,
-    )
-
-
-def interpolated_trial_dofs(
-    network: Callable[[jax.Array], jax.Array], data: InterpolationData
-) -> jax.Array:
-    r"""Coordinate interpolation of ``w_theta = Pi_h u_theta`` with a strong BC.
-
-    .. math::
-
-        \Pi_h u_\theta = \sum_{i \in I_{int}} u_\theta(x_i) \varphi_i
-            + \sum_{i \in I_\Gamma} g(x_i) \varphi_i
-
-    Interior DOFs get the network's value at their coordinate; boundary DOFs
-    get the exact Dirichlet value at their coordinate -- so the boundary
-    condition holds exactly, with no boundary loss term. Pure function of
-    plain arrays: safe to call inside a jitted training step.
+    Parameters
+    ----------
+    x : jax.Array
+        Point, shape ``(d,)``.
 
     Returns
     -------
-    jax.Array
-        The interpolant's global DOF vector, shape ``(N_dofs, 1)``.
+    value : jax.Array
+        Zero, shape ``()``.
     """
-    interior_values = jax.vmap(network)(data.dof_coordinates[data.free_dofs])
-    dof_values = jnp.zeros((data.number_of_dofs,))
-    dof_values = dof_values.at[data.free_dofs].set(interior_values)
-    dof_values = dof_values.at[data.dirichlet_dofs].set(data.dirichlet_values[:, 0])
-    return dof_values[:, None]
+    return jnp.zeros((), dtype=x.dtype)
 
 
-def interpolated_trial_function(
-    network: Callable[[jax.Array], jax.Array],
-    space: FiniteElementSpace,
-    data: InterpolationData,
+class ConstrainedAnsatz(eqx.Module):
+    """
+    Network trial function satisfying a Dirichlet condition by construction.
+
+    Attributes
+    ----------
+    network : Network
+        Free network ``u_theta``.
+    distance : Network
+        Function ``B`` vanishing on the Dirichlet boundary.
+    lift : Network
+        Extension ``g_bar`` of the Dirichlet data into the domain.
+
+    Notes
+    -----
+    The trial function is ``w = B u_theta + g_bar``. Since ``B = 0`` and
+    ``g_bar = g`` on the Dirichlet boundary, ``w = g`` there for every
+    ``u_theta``. The default lift is zero, which is correct only for
+    homogeneous data; otherwise pass, e.g., the exact solution.
+    """
+
+    network: Network
+    distance: Network
+    lift: Network
+
+    def __init__(
+        self, network: Network, distance: Network, lift: Network | None = None
+    ) -> None:
+        """
+        Initialize the ansatz.
+
+        Parameters
+        ----------
+        network : Network
+            Free network ``u_theta``.
+        distance : Network
+            Function ``B`` vanishing on the Dirichlet boundary.
+        lift : Network | None
+            Extension ``g_bar`` of the Dirichlet data; zero if ``None``.
+        """
+        self.network = network
+        self.distance = distance
+        self.lift = lift if lift is not None else _zero_lift
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """
+        Evaluate the trial function at one point.
+
+        Parameters
+        ----------
+        x : jax.Array
+            Point, shape ``(d,)``.
+
+        Returns
+        -------
+        value : jax.Array
+            ``B(x) u_theta(x) + g_bar(x)``, shape ``()``.
+        """
+        return self.distance(x) * self.network(x) + self.lift(x)
+
+
+def interpolate_network(
+    network: Network, fe_test_space: FETestSpace
 ) -> FiniteElementFunction:
-    """Convenience: ``interpolated_trial_dofs`` wrapped as a ``FiniteElementFunction``.
-
-    Not jit-safe (constructs a ``FiniteElementFunction``, which embeds
-    ``space``, a non-pytree dataclass); use for diagnostics/plotting after
-    training, not inside a training step.
     """
-    return FiniteElementFunction(
-        space=space, dof_values=interpolated_trial_dofs(network, data)
+    Nodal interpolant of a network with the Dirichlet values imposed.
+
+    Parameters
+    ----------
+    network : Network
+        Scalar function of one point.
+    fe_test_space : FETestSpace
+        Test space whose nodal space and Dirichlet data define the interpolant.
+
+    Returns
+    -------
+    interpolant : FiniteElementFunction
+        ``sum_{i free} w(x_i) phi_i + sum_{i Dirichlet} g(x_i) phi_i``, in
+        ``fe_test_space.basis.space``.
+
+    Notes
+    -----
+    The network is evaluated at every DOF coordinate and the Dirichlet entries
+    are overwritten, so the interpolant satisfies the Dirichlet condition at
+    the DOFs exactly. The space must be nodal. The function only reads arrays,
+    so it may be called inside a jitted loss.
+    """
+    space = fe_test_space.basis.space
+    values = jnp.squeeze(
+        evaluate_network_values(network, space.dof_coordinates), axis=-2
     )
+    dof_values = values.at[..., fe_test_space.dirichlet_dofs, :].set(
+        fe_test_space.dirichlet_values
+    )
+    return FiniteElementFunction(space=space, dof_values=dof_values)

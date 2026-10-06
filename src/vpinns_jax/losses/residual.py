@@ -1,180 +1,161 @@
-"""Discrete weak residual ``r_h(w_theta, v) = a_h(w_theta, v) - l_h(v)`` (math reference Section 1).
-
-Four evaluators, one per (trial representation, test space) combination
-(math reference Section 2.1/2.2's composability): direct/interpolated trial
-against an FE (``test_spaces.fe_space``) or mesh-free patch
-(``test_spaces.patch_space``) test space. All four share one pointwise
-integrand formula, ``_residual_pointwise``, matching ``jax_fem.forms
-.elliptic``'s bilinear/linear forms combined into one residual:
-
-    r_h(w, v) = int (grad v)^T mu grad(w) + v beta.grad(w) + sigma v w - f v
-
-- **Direct** trial (``w = u_theta``, e.g. a raw network or a
-  ``models.boundary.ConstrainedAnsatz``): ``w``'s value/gradient at
-  quadrature points come from ``jax.value_and_grad``, vmapped.
-- **Interpolated** trial (``w = Pi_h u_theta``): ``w`` is already a P1 FE
-  function, so the FE-test-space residual collapses to a plain sparse
-  matrix-vector product (``stiffness @ w_dofs - load``, precomputed by
-  ``test_spaces.fe_space``); the patch-test-space residual gathers
-  jax-fem's own ``evaluate_finite_element_function``.
+"""
+Discrete weak residuals of trial functions against test spaces.
 """
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jax_fem.assembly import integrate_cellwise
-from jax_fem.function import FiniteElementFunction, evaluate_finite_element_function
-from jax_fem.problem import EllipticCoefficientValues, evaluate_elliptic_coefficients
+from jax_fem.assembly import assemble_vector, integrate_cellwise
+from jax_fem.forms import elliptic_bilinear_form, elliptic_linear_form
+from jax_fem.function import FiniteElementFunctionEvaluation
 
-from vpinns_jax.pde.base import EllipticPDE
 from vpinns_jax.test_spaces.fe_space import FETestSpace
-from vpinns_jax.test_spaces.patch_space import PatchTestSpace, gather_patch_quadrature
-
-__all__ = [
-    "evaluate_trial_at_points",
-    "direct_trial_fe_residual",
-    "interpolated_trial_fe_residual",
-    "direct_trial_patch_residual",
-    "interpolated_trial_patch_residual",
-]
+from vpinns_jax.test_spaces.patch_space import PatchTestSpace, assemble_patch_vector
 
 
-def evaluate_trial_at_points(network, points: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """``(values, gradients)`` of a direct trial ``network`` at physical points.
+def compute_fe_residual(
+    fe_test_space: FETestSpace, trial: FiniteElementFunctionEvaluation
+) -> jax.Array:
+    """
+    Weak residual of a trial function evaluated at the quadrature points.
 
     Parameters
     ----------
-    network : Callable[[jax.Array], jax.Array]
-        A single-point scalar evaluator ``x: (d,) -> u_theta(x): ()``
-        (``models.ansatz``/``models.boundary.ConstrainedAnsatz``'s
-        convention).
-    points : jax.Array
-        Shape ``(*batch, 1, d)``.
+    fe_test_space : FETestSpace
+        Test space.
+    trial : FiniteElementFunctionEvaluation
+        Trial values, shape ``(K, Q, 1, 1)``, and gradients, shape
+        ``(K, Q, 1, d)``, at ``fe_test_space.basis.physical_points``, e.g.
+        from ``evaluate_network``.
 
     Returns
     -------
-    values : jax.Array
-        Shape ``(*batch, 1, 1)``.
-    gradients : jax.Array
-        Shape ``(*batch, 1, d)``.
-    """
-    flat_points = points.reshape(-1, points.shape[-1])
-    flat_values, flat_gradients = jax.vmap(jax.value_and_grad(network))(flat_points)
-    values = flat_values.reshape(*points.shape[:-1], 1)
-    gradients = flat_gradients.reshape(*points.shape[:-2], 1, points.shape[-1])
-    return values, gradients
+    residual : jax.Array
+        ``a(w, psi_i) - l(psi_i)`` for every DOF ``i``, shape
+        ``(dofs_test, 1)``.
 
-
-def _residual_pointwise(
-    test_values: jax.Array,
-    test_gradients: jax.Array,
-    trial_values: jax.Array,
-    trial_gradients: jax.Array,
-    coefficients: EllipticCoefficientValues,
-) -> jax.Array:
-    """``r_h(w, v)`` pointwise integrand, broadcasting ``test_*`` against ``trial_*``."""
-    diffusion_term = test_gradients @ coefficients.diffusion @ jnp.swapaxes(
-        trial_gradients, -1, -2
-    )
-    advection_term = test_values * (
-        trial_gradients @ jnp.swapaxes(coefficients.advection, -1, -2)
-    )
-    reaction_term = coefficients.reaction * test_values * trial_values
-    load_term = coefficients.source * test_values
-    return diffusion_term + advection_term + reaction_term - load_term
-
-
-def _scatter_to_dofs(
-    local_vectors: jax.Array, cells_to_dofs: jax.Array, number_of_dofs: int
-) -> jax.Array:
-    """``(K, N_phi, 1) -> (N_dofs, 1)`` scatter-add (mirrors ``assemble_linear_form``)."""
-    flat_indices = cells_to_dofs.reshape(-1)
-    flat_values = local_vectors.reshape(-1)
-    global_vector = jnp.zeros((number_of_dofs,), dtype=flat_values.dtype)
-    global_vector = global_vector.at[flat_indices].add(flat_values)
-    return global_vector[:, None]
-
-
-def direct_trial_fe_residual(network, fe_test_space: FETestSpace) -> jax.Array:
-    """``r_h(u_theta, psi_i))_i`` for every FE test/trial DOF ``i``, direct trial.
-
-    Returns
-    -------
-    jax.Array
-        Shape ``(N_dofs, 1)``; restrict to ``fe_test_space.free_dofs`` for
-        the interior test space ``V_h subset H^1_0``.
+    Notes
+    -----
+    The trial evaluation enters the ``jax_fem`` elliptic forms as a trial
+    basis with a single function, so the residual uses exactly the forms of
+    the finite element discretization, integrated with the test space's
+    quadrature.
     """
     basis = fe_test_space.basis
-    trial_values, trial_gradients = evaluate_trial_at_points(network, basis.physical_points)
-    pointwise = _residual_pointwise(
-        basis.values, basis.gradients, trial_values, trial_gradients, fe_test_space.coefficients
+    coefficients = fe_test_space.coefficients
+    pointwise = elliptic_bilinear_form(basis, trial, coefficients) - (
+        elliptic_linear_form(basis, coefficients)
     )
-    local_vectors = integrate_cellwise(pointwise, basis.physical_weights)
-    return _scatter_to_dofs(
-        local_vectors, fe_test_space.space.cells_to_dofs, fe_test_space.space.number_of_dofs
+    return assemble_vector(
+        integrate_cellwise(pointwise, basis.physical_weights), basis.space
     )
 
 
-def interpolated_trial_fe_residual(w_dofs: jax.Array, fe_test_space: FETestSpace) -> jax.Array:
-    """``r_h(Pi_h u_theta, psi_i))_i``: ``stiffness @ w_dofs - load``, shape ``(N_dofs, 1)``."""
-    return fe_test_space.stiffness @ w_dofs - fe_test_space.load
-
-
-def direct_trial_patch_residual(
-    network, patch_space: PatchTestSpace, problem: EllipticPDE
+def compute_interpolated_fe_residual(
+    fe_test_space: FETestSpace, dof_values: jax.Array
 ) -> jax.Array:
-    """``r_h(u_theta, varphi_i))_i`` for every patch ``i``, direct trial.
+    """
+    Weak residual of a finite element trial function.
+
+    Parameters
+    ----------
+    fe_test_space : FETestSpace
+        Test space whose space also holds the trial function.
+    dof_values : jax.Array
+        Trial DOF values, shape ``(dofs_test, 1)``.
 
     Returns
     -------
-    jax.Array
-        Shape ``(N_patch,)``.
+    residual : jax.Array
+        ``stiffness @ w - load``, shape ``(dofs_test, 1)``.
     """
-    patch_quadrature = gather_patch_quadrature(patch_space)
-    batch_shape = patch_quadrature.physical_points.shape[:-2]
-    trial_values, trial_gradients = evaluate_trial_at_points(
-        network, patch_quadrature.physical_points
-    )
-    coefficients = evaluate_elliptic_coefficients(problem, patch_quadrature.physical_points)
-    pointwise = _residual_pointwise(
-        patch_quadrature.hat_values,
-        patch_quadrature.hat_gradients,
-        trial_values,
-        trial_gradients,
-        coefficients,
-    )
-    weighted = patch_quadrature.physical_weights * pointwise
-    return jnp.sum(weighted.reshape(batch_shape[0], -1), axis=-1)
+    return fe_test_space.stiffness @ dof_values - fe_test_space.load
 
 
-def interpolated_trial_patch_residual(
-    solution: FiniteElementFunction, patch_space: PatchTestSpace, problem: EllipticPDE
+def compute_patch_residual(
+    patch_test_space: PatchTestSpace, trial: FiniteElementFunctionEvaluation
 ) -> jax.Array:
-    """``r_h(Pi_h u_theta, varphi_i))_i`` for every patch ``i``, interpolated trial.
+    """
+    Weak residual of a trial function against the patch test functions.
+
+    Parameters
+    ----------
+    patch_test_space : PatchTestSpace
+        Patch test space.
+    trial : FiniteElementFunctionEvaluation
+        Trial values, shape ``(K, Q, 1, 1)``, and gradients, shape
+        ``(K, Q, 1, d)``, at ``patch_test_space.basis.physical_points``, e.g.
+        from ``evaluate_network``.
 
     Returns
     -------
-    jax.Array
-        Shape ``(N_patch,)``.
+    residual : jax.Array
+        ``a(w, psi_i) - l(psi_i)`` for every patch ``i``, shape
+        ``(N_patch, 1)``.
+
+    Notes
+    -----
+    Every integration cell is visited once, with the trial evaluated once at
+    its quadrature points, and contributes to all patches listed on it. Only
+    the entries of ``family.interior_patches`` are residuals of test
+    functions in ``H^1_0``.
     """
-    evaluation = evaluate_finite_element_function(solution, patch_space.basis)
-    mask = patch_space.patch_mask
-    safe_cell = jnp.where(mask, patch_space.patch_cells, 0)
-    trial_values = evaluation.values[safe_cell]
-    trial_gradients = jnp.broadcast_to(
-        evaluation.gradients[safe_cell], trial_values.shape[:-1] + (2,)
+    test_functions = patch_test_space.test_functions
+    coefficients = patch_test_space.coefficients
+    pointwise = elliptic_bilinear_form(test_functions, trial, coefficients) - (
+        elliptic_linear_form(test_functions, coefficients)
+    )
+    return assemble_patch_vector(
+        integrate_cellwise(pointwise, patch_test_space.basis.physical_weights),
+        patch_test_space.family,
     )
 
-    patch_quadrature = gather_patch_quadrature(patch_space)
-    batch_shape = patch_quadrature.physical_points.shape[:-2]
-    coefficients = evaluate_elliptic_coefficients(problem, patch_quadrature.physical_points)
-    pointwise = _residual_pointwise(
-        patch_quadrature.hat_values,
-        patch_quadrature.hat_gradients,
-        trial_values,
-        trial_gradients,
-        coefficients,
+
+def compute_patch_residual_terms(
+    patch_test_space: PatchTestSpace,
+    trial: FiniteElementFunctionEvaluation,
+    flux_divergence: jax.Array,
+) -> jax.Array:
+    """
+    Squared weighted strong residuals of a smooth trial function on every patch.
+
+    Parameters
+    ----------
+    patch_test_space : PatchTestSpace
+        Patch test space.
+    trial : FiniteElementFunctionEvaluation
+        Trial values, shape ``(K, Q, 1, 1)``, and gradients, shape
+        ``(K, Q, 1, d)``, at ``patch_test_space.basis.physical_points``.
+    flux_divergence : jax.Array
+        ``div(A grad w)`` at the same points, shape ``(K, Q, 1, 1)``, e.g. from
+        ``evaluate_network_flux_divergence``.
+
+    Returns
+    -------
+    squared_terms : jax.Array
+        ``eta_R,i^2 = h_i^2 ||phi_i^(1/2) rho(w)||^2_(P_i)`` for every patch
+        ``i``, interior and boundary, shape ``(N_patch, 1)``.
+
+    Notes
+    -----
+    The strong residual is ``rho(w) = f + div(A grad w) - beta . grad w - c w``
+    and is weighted by the raw weight ``phi_i``. The terms bound the part of
+    the residual that the patch test space cannot see. Edge residuals are
+    omitted, which is exact for trial functions with continuous fluxes, such
+    as networks with smooth activations and coefficients; the shape-regularity
+    constants of the patches are not included.
+    """
+    coefficients = patch_test_space.coefficients
+    strong_residual = (
+        coefficients.source
+        + flux_divergence
+        - coefficients.advection @ trial.gradients.mT
+        - coefficients.reaction * trial.values
     )
-    weighted = patch_quadrature.physical_weights * pointwise
-    return jnp.sum(weighted.reshape(batch_shape[0], -1), axis=-1)
+    local_terms = integrate_cellwise(
+        patch_test_space.raw_weights.values * strong_residual**2,
+        patch_test_space.basis.physical_weights,
+    )
+    diameters = jnp.expand_dims(patch_test_space.family.patch_diameters, axis=-1)
+    return diameters**2 * assemble_patch_vector(local_terms, patch_test_space.family)
