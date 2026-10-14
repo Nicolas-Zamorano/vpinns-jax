@@ -1,35 +1,29 @@
-"""Discrete residuals, Riesz loss, and boundary losses (implementation plan Component 4)."""
+"""
+Residual vectors and the losses built from them.
+"""
 
 from vpinns_jax.losses.boundary_residual import boundary_residual_loss
 from vpinns_jax.losses.euclidean import euclidean_loss
 from vpinns_jax.losses.residual import (
-    direct_trial_fe_residual,
-    direct_trial_patch_residual,
-    evaluate_trial_at_points,
-    interpolated_trial_fe_residual,
-    interpolated_trial_patch_residual,
+    compute_fe_residual,
+    compute_interpolated_fe_residual,
+    compute_meshfree_patch_residual,
+    compute_meshfree_patch_residual_terms,
+    compute_patch_residual,
+    compute_patch_residual_terms,
 )
-from vpinns_jax.losses.riesz import (
-    assemble_energy_gram_matrix,
-    energy_bilinear_form,
-    patch_self_energy,
-    restrict_to_free_dofs,
-    riesz_loss_global,
-    riesz_loss_patch,
-)
+from vpinns_jax.losses.riesz import diagonal_riesz_loss, restrict_to_free, riesz_loss
 
 __all__ = [
-    "evaluate_trial_at_points",
-    "direct_trial_fe_residual",
-    "interpolated_trial_fe_residual",
-    "direct_trial_patch_residual",
-    "interpolated_trial_patch_residual",
+    "compute_fe_residual",
+    "compute_interpolated_fe_residual",
+    "compute_patch_residual",
+    "compute_patch_residual_terms",
+    "compute_meshfree_patch_residual",
+    "compute_meshfree_patch_residual_terms",
     "euclidean_loss",
-    "energy_bilinear_form",
-    "assemble_energy_gram_matrix",
-    "restrict_to_free_dofs",
-    "riesz_loss_global",
-    "patch_self_energy",
-    "riesz_loss_patch",
+    "restrict_to_free",
+    "riesz_loss",
+    "diagonal_riesz_loss",
     "boundary_residual_loss",
 ]

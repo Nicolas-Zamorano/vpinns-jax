@@ -1,10 +1,5 @@
-"""Finite-element test space ``V_h``, a thin bundle over jax-fem's own FE machinery.
-
-Wraps ``jax_fem``'s ``FiniteElementSpace``/``CellBasis`` and pre-assembles
-the global stiffness matrix and load vector (``elliptic_bilinear_form`` /
-``elliptic_linear_form``), so ``losses.residual``'s interpolated-trial fast
-path (``r = stiffness @ w_dofs - load``) and direct-trial path (needs
-``basis``/``coefficients``) both have what they need without recomputing it.
+"""
+Conforming finite element test spaces.
 """
 
 from __future__ import annotations
@@ -13,105 +8,165 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
-from jax_fem.assembly import GlobalMatrix, assemble_bilinear_form, assemble_linear_form
-from jax_fem.constraints import evaluate_dirichlet_dof_values
-from jax_fem.element import FiniteElement, LagrangeTriangleP1
-from jax_fem.forms import elliptic_bilinear_form, elliptic_linear_form
-from jax_fem.mesh import TriangleMesh
-from jax_fem.problem import EllipticCoefficientValues, evaluate_elliptic_coefficients
-from jax_fem.reference_cell import ReferenceTriangle
-from jax_fem.space import (
-    CellBasis,
-    FiniteElementSpace,
-    create_cell_basis,
-    create_finite_element_space,
+from jax_fem.assembly import (
+    GlobalMatrix,
+    assemble_matrix,
+    assemble_vector,
+    integrate_cellwise,
 )
-
-from vpinns_jax.pde.base import EllipticPDE
-
-__all__ = ["FETestSpace", "create_fe_test_space"]
+from jax_fem.constraints import evaluate_dirichlet_dof_values
+from jax_fem.forms import (
+    elliptic_bilinear_form,
+    elliptic_energy_bilinear_form,
+    elliptic_linear_form,
+)
+from jax_fem.problem import EllipticCoefficientValues, EllipticProblem
+from jax_fem.space import CellBasis
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class FETestSpace:
-    """FE test space bundle for one ``(mesh, element, problem, quadrature)`` combination.
+    """
+    Conforming finite element test space with its assembled operators.
 
     Attributes
     ----------
-    mesh, element, space, basis :
-        The underlying jax-fem mesh/element/space/quadrature-evaluated basis.
+    basis : CellBasis
+        Evaluated basis of the space; its quadrature is used for every
+        residual.
     coefficients : EllipticCoefficientValues
-        Elliptic coefficients evaluated at ``basis.physical_points``.
-    free_dofs, dirichlet_dofs, dirichlet_values :
-        DOF classification; ``I_test = free_dofs`` is the interior test
-        space (``V_h subset H^1_0``).
-    stiffness, load :
-        Assembled global operators. The interpolated-trial residual is
-        ``r = stiffness @ w_dofs - load`` (``losses.residual``).
-    number_of_test_functions : int
-        ``len(free_dofs)``.
+        Coefficients at ``basis.physical_points``.
+    dirichlet_dofs : jax.Array
+        Dirichlet DOF indices in increasing order, shape ``(N_dirichlet,)``.
+    dirichlet_values : jax.Array
+        Prescribed Dirichlet values, shape ``(N_dirichlet, 1)``.
+    free_dofs : jax.Array
+        Remaining DOF indices in increasing order, shape ``(N_free,)``.
+    stiffness : GlobalMatrix
+        Matrix of the elliptic bilinear form, shape ``(dofs_test, dofs_test)``.
+    load : jax.Array
+        Vector of the elliptic linear form, shape ``(dofs_test, 1)``.
+    gram : GlobalMatrix
+        Matrix of the energy inner product, shape ``(dofs_test, dofs_test)``.
+
+    Notes
+    -----
+    The test functions are the basis functions of the free DOFs, a basis of
+    the discrete subspace of ``H^1_0``. Residual vectors are assembled over
+    all DOFs and restricted to ``free_dofs`` by the caller.
+
+    On a discrete fracture network the basis is embedded and the diffusion is
+    the per-cell fracture transmissivity. Trace vertices are shared, so a
+    finite element trial is continuous across traces and may kink there, as
+    the exact head does. A direct network trial that is continuously
+    differentiable inside each fracture cannot: its conormal fluxes from the
+    two halves of a fracture cancel at an X-crossing, so it exchanges no flux
+    between fractures there. The interpolated trial avoids this on a fixed
+    mesh, since the network only has to match nodal values.
     """
 
-    mesh: TriangleMesh
-    element: FiniteElement
-    space: FiniteElementSpace
     basis: CellBasis
     coefficients: EllipticCoefficientValues
-    free_dofs: jax.Array
     dirichlet_dofs: jax.Array
     dirichlet_values: jax.Array
+    free_dofs: jax.Array
     stiffness: GlobalMatrix
     load: jax.Array
-    number_of_test_functions: int
+    gram: GlobalMatrix
+
+    def __post_init__(self) -> None:
+        """
+        Validate the array shapes.
+
+        Raises
+        ------
+        ValueError
+            If an operator does not match the number of DOFs, or the Dirichlet
+            and free DOFs do not partition the DOFs.
+        """
+        number_of_dofs = self.basis.space.number_of_dofs
+        square = (number_of_dofs, number_of_dofs)
+        if self.stiffness.shape != square or self.gram.shape != square:
+            raise ValueError(
+                f"stiffness and gram must have shape {square}, got "
+                f"{self.stiffness.shape} and {self.gram.shape}."
+            )
+        if self.load.shape != (number_of_dofs, 1):
+            raise ValueError(
+                f"load must have shape {(number_of_dofs, 1)}, got {self.load.shape}."
+            )
+        number_of_dirichlet_dofs = self.dirichlet_dofs.shape[-1]
+        if self.dirichlet_values.shape != (number_of_dirichlet_dofs, 1):
+            raise ValueError(
+                "dirichlet_values must have shape "
+                f"{(number_of_dirichlet_dofs, 1)}, got {self.dirichlet_values.shape}."
+            )
+        if number_of_dirichlet_dofs + self.free_dofs.shape[-1] != number_of_dofs:
+            raise ValueError(
+                "dirichlet_dofs and free_dofs must partition the "
+                f"{number_of_dofs} DOFs."
+            )
 
 
 def create_fe_test_space(
-    mesh: TriangleMesh,
-    problem: EllipticPDE,
-    *,
-    element: FiniteElement | None = None,
-    quadrature_degree: int = 4,
+    basis: CellBasis,
+    coefficients: EllipticCoefficientValues,
+    problem: EllipticProblem,
 ) -> FETestSpace:
-    """Build the FE test space for ``problem`` on ``mesh``.
+    """
+    Assemble the operators of a finite element test space.
 
     Parameters
     ----------
-    mesh : TriangleMesh
-    problem : EllipticPDE
-    element : FiniteElement | None
-        Defaults to ``LagrangeTriangleP1``.
-    quadrature_degree : int
-        Cell quadrature exactness degree.
+    basis : CellBasis
+        Evaluated basis of the space, planar or embedded.
+    coefficients : EllipticCoefficientValues
+        Coefficients at ``basis.physical_points``.
+    problem : EllipticProblem
+        Problem providing the Dirichlet conditions.
 
     Returns
     -------
-    FETestSpace
+    fe_test_space : FETestSpace
+        The test space with its stiffness matrix, load vector, energy Gram
+        matrix, and DOF classification.
+
+    Notes
+    -----
+    The basis and coefficients are built by the caller, so the same
+    constructor serves planar bases (``create_cell_basis``), embedded bases
+    (``create_embedded_cell_basis``), and coefficients whose diffusion was
+    replaced, e.g. by a per-cell fracture transmissivity. The DOF
+    classification has a data-dependent size, so this function is eager.
     """
-    element = element if element is not None else LagrangeTriangleP1(ReferenceTriangle())
-    space = create_finite_element_space(mesh, element)
-    quadrature = element.reference_cell.create_quadrature(quadrature_degree)
-    basis = create_cell_basis(space, quadrature)
-    coefficients = evaluate_elliptic_coefficients(problem, basis.physical_points)
-
-    stiffness = assemble_bilinear_form(elliptic_bilinear_form, basis, coefficients)
-    load = assemble_linear_form(elliptic_linear_form, basis, coefficients)
-
+    space = basis.space
+    weights = basis.physical_weights
+    stiffness = assemble_matrix(
+        integrate_cellwise(elliptic_bilinear_form(basis, basis, coefficients), weights),
+        space,
+        space,
+    )
+    load = assemble_vector(
+        integrate_cellwise(elliptic_linear_form(basis, coefficients), weights), space
+    )
+    gram = assemble_matrix(
+        integrate_cellwise(
+            elliptic_energy_bilinear_form(basis, basis, coefficients), weights
+        ),
+        space,
+        space,
+    )
     dirichlet_dofs, dirichlet_values = evaluate_dirichlet_dof_values(problem, space)
     is_dirichlet = (
         jnp.zeros((space.number_of_dofs,), dtype=bool).at[dirichlet_dofs].set(True)
     )
-    free_dofs = jnp.nonzero(~is_dirichlet)[0]
-
     return FETestSpace(
-        mesh=mesh,
-        element=element,
-        space=space,
         basis=basis,
         coefficients=coefficients,
-        free_dofs=free_dofs,
         dirichlet_dofs=dirichlet_dofs,
         dirichlet_values=dirichlet_values,
+        free_dofs=jnp.flatnonzero(~is_dirichlet),
         stiffness=stiffness,
         load=load,
-        number_of_test_functions=int(free_dofs.shape[0]),
+        gram=gram,
     )
