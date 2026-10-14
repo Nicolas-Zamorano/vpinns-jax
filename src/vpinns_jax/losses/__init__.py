@@ -7,6 +7,8 @@ from vpinns_jax.losses.euclidean import euclidean_loss
 from vpinns_jax.losses.residual import (
     compute_fe_residual,
     compute_interpolated_fe_residual,
+    compute_meshfree_patch_residual,
+    compute_meshfree_patch_residual_terms,
     compute_patch_residual,
     compute_patch_residual_terms,
 )
@@ -17,6 +19,8 @@ __all__ = [
     "compute_interpolated_fe_residual",
     "compute_patch_residual",
     "compute_patch_residual_terms",
+    "compute_meshfree_patch_residual",
+    "compute_meshfree_patch_residual_terms",
     "euclidean_loss",
     "restrict_to_free",
     "riesz_loss",

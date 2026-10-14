@@ -6,12 +6,14 @@ for the Poisson problem with solution sin(pi x) sin(pi y) and the Dirichlet
 condition imposed by the ansatz. Each level records the errors, the estimator
 terms, and the ratio of the estimator to the energy error; the history is
 plotted against the number of test functions, and every level's training
-quantities, loss terms, robustness, solution, and cellwise errors are plotted,
-all under ``experiments/``.
+quantities, loss terms, robustness, and solution surfaces are plotted, all
+under ``experiments/``.
 
 The trial set does not change with ``n``, so the error is limited by the
 training as well as by the test space; the study checks that the estimator
-stays comparable to the energy error on every level.
+stays comparable to the energy error on every level. The errors of every
+level are measured on the same fixed, finer mesh of the unit square with the
+degree-5 quadrature, independent of the patches.
 
 Run with:
 
@@ -34,17 +36,22 @@ from jax_fem.diagnostics import (
     l2_error_functional,
     save_plot,
 )
+from jax_fem.element import LagrangeTriangleP1
+from jax_fem.mesh import create_gmsh_unit_square_mesh
 from jax_fem.problem import create_poisson_sin_sin_problem
+from jax_fem.reference_cell import ReferenceTriangle
+from jax_fem.space import CellBasis, create_cell_basis, create_finite_element_space
 
 from vpinns_jax.analysis import (
     compute_network_error,
     compute_solution_norm,
     create_training_monitor,
-    plot_cell_errors,
+    line_style,
     plot_loss_terms,
     plot_network_solution,
     plot_robustness,
     plot_training_quantities,
+    show_grid,
 )
 from vpinns_jax.losses import (
     compute_patch_residual,
@@ -68,6 +75,7 @@ _COLUMNS = ("test functions", "L2 error", "energy error", "eta_P", "eta_R", "est
 def _run_level(
     cells_per_side: int,
     network: MultiLayerPerceptron,
+    error_basis: CellBasis,
     output_directory: Path,
     *,
     num_steps: int,
@@ -83,6 +91,8 @@ def _run_level(
         Number of grid squares per side.
     network : MultiLayerPerceptron
         Initial free network.
+    error_basis : CellBasis
+        Basis of the mesh on which the errors are measured.
     output_directory : Path
         Directory of the plots, prefixed with the level.
     num_steps : int
@@ -186,7 +196,7 @@ def _run_level(
         """
         return compute_network_error(
             ConstrainedAnsatz(model, distance),
-            space.basis,
+            error_basis,
             problem,
             energy_error_functional,
         )
@@ -194,7 +204,7 @@ def _run_level(
     monitor = create_training_monitor(
         loss_terms,
         energy_error,
-        compute_solution_norm(space.basis, problem, energy_error_functional),
+        compute_solution_norm(error_basis, problem, energy_error_functional),
     )
     network, history = train_adam(
         loss_fn,
@@ -205,22 +215,17 @@ def _run_level(
         monitor_every=max(1, num_steps // 100),
     )
     trial_network = ConstrainedAnsatz(network, distance)
-    cell_errors = {
-        "$L^2$ error": compute_network_error(
-            trial_network, space.basis, problem, l2_error_functional, reduce=False
-        ),
-        "energy error": compute_network_error(
-            trial_network, space.basis, problem, energy_error_functional, reduce=False
-        ),
-    }
-    l2 = jnp.sqrt(jnp.sum(cell_errors["$L^2$ error"] ** 2))
-    energy = jnp.sqrt(jnp.sum(cell_errors["energy error"] ** 2))
+    l2 = compute_network_error(trial_network, error_basis, problem, l2_error_functional)
+    energy = compute_network_error(
+        trial_network, error_basis, problem, energy_error_functional
+    )
     figures = {
         "training": plot_training_quantities(history),
         "loss_terms": plot_loss_terms(history),
         "robustness": plot_robustness(history),
-        "solution": plot_network_solution(trial_network, family.mesh, problem),
-        "cell_errors": plot_cell_errors(family.mesh, cell_errors),
+        "solution": plot_network_solution(
+            trial_network, error_basis.space.mesh, problem
+        ),
     }
     for name, figure in figures.items():
         save_plot(figure, output_directory / f"n{cells_per_side}_{name}.png")
@@ -237,6 +242,7 @@ def main(
     learning_rate: float = 1e-3,
     residual_weight: float = 1.0,
     seed: int = 0,
+    error_cells_per_side: int = 64,
 ) -> None:
     """
     Train on every family and record errors and estimator terms.
@@ -257,7 +263,17 @@ def main(
         Weight ``lambda`` of the residual terms in the loss.
     seed : int
         Seed of the initial network weights, shared by all levels.
+    error_cells_per_side : int
+        Resolution of the mesh on which the errors of every level are
+        measured.
     """
+    element = LagrangeTriangleP1(reference_cell=ReferenceTriangle())
+    error_basis = create_cell_basis(
+        create_finite_element_space(
+            create_gmsh_unit_square_mesh(error_cells_per_side), element
+        ),
+        element.reference_cell.create_quadrature(5),
+    )
     print(
         "    n"
         + "".join(f"{column:>15s}" for column in _COLUMNS)
@@ -272,6 +288,7 @@ def main(
         record = _run_level(
             cells_per_side,
             MultiLayerPerceptron(width=width, depth=depth, key=jr.PRNGKey(seed)),
+            error_basis,
             output_directory,
             num_steps=num_steps,
             learning_rate=learning_rate,
@@ -287,11 +304,17 @@ def main(
     table = np.asarray(records)
     figure, axis = plt.subplots(figsize=(6, 4))
     for column in range(2, len(_COLUMNS)):
-        axis.loglog(table[:, 0], table[:, column], "o-", label=_COLUMNS[column])
+        axis.loglog(
+            table[:, 0],
+            table[:, column],
+            marker="o",
+            label=_COLUMNS[column],
+            **line_style(column - 2),
+        )
     axis.set_xlabel("number of test functions")
     axis.set_title("MF-VPINN with the estimator loss")
     axis.legend()
-    axis.grid(True, which="both", linestyle=":", linewidth=0.5)
+    show_grid(axis)
 
     save_plot(figure, output_directory / "convergence.png")
     print(f"Saved plots to {output_directory}/")

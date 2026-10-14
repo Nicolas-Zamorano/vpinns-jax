@@ -33,6 +33,7 @@ from jax_fem.problem import (
     create_full_boundary_dirichlet_condition,
 )
 
+from vpinns_jax.analysis import line_style, show_grid
 from vpinns_jax.losses import (
     compute_patch_residual,
     compute_patch_residual_terms,
@@ -169,13 +170,21 @@ def main(grid_sizes: tuple[int, ...] = (4, 8, 16, 32)) -> None:
 
     table = np.stack(rows)
     figure, axis = plt.subplots(figsize=(6, 4))
-    for column, label in enumerate(labels):
-        axis.loglog(grid_sizes, table[:, column], "o-", label=label)
+    legend_labels = (
+        r"$\eta_P$ with $\psi_i$",
+        r"$\eta_P$ with $\varphi_i$",
+        r"$\eta_D$ with $\psi_i$",
+        r"$\eta_R$",
+    )
+    for column, label in enumerate(legend_labels):
+        axis.loglog(
+            grid_sizes, table[:, column], marker="o", label=label, **line_style(column)
+        )
     axis.set_xlabel("n (grid squares per side)")
     axis.set_ylabel(r"ratio to $\|\nabla e\|$")
     axis.set_title("Fixed error under refinement")
     axis.legend()
-    axis.grid(True, which="both", linestyle=":", linewidth=0.5)
+    show_grid(axis)
 
     output_directory = create_timestamped_output_directory(
         "experiments", "04_shepard_normalisation"

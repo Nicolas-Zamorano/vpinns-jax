@@ -54,6 +54,15 @@ class FETestSpace:
     The test functions are the basis functions of the free DOFs, a basis of
     the discrete subspace of ``H^1_0``. Residual vectors are assembled over
     all DOFs and restricted to ``free_dofs`` by the caller.
+
+    On a discrete fracture network the basis is embedded and the diffusion is
+    the per-cell fracture transmissivity. Trace vertices are shared, so a
+    finite element trial is continuous across traces and may kink there, as
+    the exact head does. A direct network trial that is continuously
+    differentiable inside each fracture cannot: its conormal fluxes from the
+    two halves of a fracture cancel at an X-crossing, so it exchanges no flux
+    between fractures there. The interpolated trial avoids this on a fixed
+    mesh, since the network only has to match nodal values.
     """
 
     basis: CellBasis

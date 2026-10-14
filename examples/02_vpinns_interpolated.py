@@ -4,8 +4,8 @@ The trial function is the P1 interpolant of a network, with the Dirichlet
 values imposed at the boundary DOFs. Since it is a finite element function,
 its residual is ``stiffness @ w - load``, restricted to the interior DOFs. The
 network is trained with the Euclidean loss; the training quantities, the
-robustness ``sqrt(L) / |u - w|_A``, the interpolant, and its cellwise errors
-are plotted under ``experiments/``.
+robustness ``sqrt(L) / |u - w|_A``, and the cellwise L2 and energy errors of the
+interpolant on the mesh are plotted under ``experiments/``.
 
 Run with:
 
@@ -41,7 +41,6 @@ from vpinns_jax.analysis import (
     compute_solution_norm,
     create_training_monitor,
     plot_cell_errors,
-    plot_fe_solution,
     plot_loss_terms,
     plot_robustness,
     plot_training_quantities,
@@ -179,7 +178,6 @@ def main(
         "training": plot_training_quantities(history),
         "loss_terms": plot_loss_terms(history),
         "robustness": plot_robustness(history),
-        "solution": plot_fe_solution(solution, problem),
         "cell_errors": plot_cell_errors(mesh, cell_errors),
     }
     for name, figure in figures.items():

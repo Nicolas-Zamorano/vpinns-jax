@@ -6,8 +6,9 @@ against the P1 basis functions of the interior vertices. One network is
 trained with the Euclidean loss ``r^T r`` and one with the Riesz loss
 ``r^T G^{-1} r``, where ``G`` is the energy Gram matrix of the test functions,
 and their errors are compared. For each loss the training quantities, the
-robustness ``sqrt(L) / |u - w|_A``, the solution, and the cellwise errors are
-plotted under ``experiments/``.
+robustness ``sqrt(L) / |u - w|_A``, and the exact and network solutions with
+their pointwise error, as surfaces on a uniform grid, are plotted under
+``experiments/``.
 
 Run with:
 
@@ -41,7 +42,6 @@ from vpinns_jax.analysis import (
     compute_network_error,
     compute_solution_norm,
     create_training_monitor,
-    plot_cell_errors,
     plot_loss_terms,
     plot_network_solution,
     plot_robustness,
@@ -231,17 +231,9 @@ def main(
         elapsed = time.perf_counter() - start
 
         trial = ConstrainedAnsatz(network, distance)
-        cell_errors = {
-            "$L^2$ error": compute_network_error(
-                trial, basis, problem, l2_error_functional, reduce=False
-            ),
-            "energy error": compute_network_error(
-                trial, basis, problem, energy_error_functional, reduce=False
-            ),
-        }
-        l2 = jnp.sqrt(jnp.sum(cell_errors["$L^2$ error"] ** 2))
+        l2 = compute_network_error(trial, basis, problem, l2_error_functional)
         h1 = compute_network_error(trial, basis, problem, h1_seminorm_error_functional)
-        energy = jnp.sqrt(jnp.sum(cell_errors["energy error"] ** 2))
+        energy = compute_network_error(trial, basis, problem, energy_error_functional)
         print(
             f"[{loss_name:9s}] {elapsed:.2f}s | relative L2 {float(l2 / l2_norm):.4e} "
             f"| H1 seminorm {float(h1):.4e} | energy {float(energy):.4e} "
@@ -253,7 +245,6 @@ def main(
             "loss_terms": plot_loss_terms(history),
             "robustness": plot_robustness(history),
             "solution": plot_network_solution(trial, mesh, problem),
-            "cell_errors": plot_cell_errors(mesh, cell_errors),
         }
         for name, figure in figures.items():
             save_plot(figure, output_directory / f"{loss_name}_{name}.png")

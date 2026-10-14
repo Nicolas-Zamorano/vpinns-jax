@@ -11,6 +11,7 @@ from jax_fem.forms import elliptic_bilinear_form, elliptic_linear_form
 from jax_fem.function import FiniteElementFunctionEvaluation
 
 from vpinns_jax.test_spaces.fe_space import FETestSpace
+from vpinns_jax.test_spaces.meshfree_space import MeshfreePatchTestSpace
 from vpinns_jax.test_spaces.patch_space import PatchTestSpace, assemble_patch_vector
 
 
@@ -159,3 +160,87 @@ def compute_patch_residual_terms(
     )
     diameters = jnp.expand_dims(patch_test_space.family.patch_diameters, axis=-1)
     return diameters**2 * assemble_patch_vector(local_terms, patch_test_space.family)
+
+
+def compute_meshfree_patch_residual(
+    patch_test_space: MeshfreePatchTestSpace, trial: FiniteElementFunctionEvaluation
+) -> jax.Array:
+    """
+    Weak residual of a trial function against patch test functions, patch by patch.
+
+    Parameters
+    ----------
+    patch_test_space : MeshfreePatchTestSpace
+        Patch test space.
+    trial : FiniteElementFunctionEvaluation
+        Trial values, shape ``(N_patch, P, 1, 1)``, and gradients, shape
+        ``(N_patch, P, 1, d)``, at ``patch_test_space.points``, e.g. from
+        ``evaluate_network``.
+
+    Returns
+    -------
+    residual : jax.Array
+        ``a(w, psi_i) - l(psi_i)`` for every patch ``i``, shape
+        ``(N_patch, 1)``.
+
+    Notes
+    -----
+    Each entry is integrated over its own patch with the patch's local
+    quadrature, so no assembly is needed. Only the entries of
+    ``family.interior_patches`` are residuals of test functions in
+    ``H^1_0``.
+    """
+    test_functions = patch_test_space.test_functions
+    coefficients = patch_test_space.coefficients
+    pointwise = elliptic_bilinear_form(test_functions, trial, coefficients) - (
+        elliptic_linear_form(test_functions, coefficients)
+    )
+    return jnp.squeeze(
+        integrate_cellwise(pointwise, patch_test_space.weights), axis=(-3, -2)
+    )
+
+
+def compute_meshfree_patch_residual_terms(
+    patch_test_space: MeshfreePatchTestSpace,
+    trial: FiniteElementFunctionEvaluation,
+    flux_divergence: jax.Array,
+) -> jax.Array:
+    """
+    Squared weighted strong residuals of a smooth trial function, patch by patch.
+
+    Parameters
+    ----------
+    patch_test_space : MeshfreePatchTestSpace
+        Patch test space.
+    trial : FiniteElementFunctionEvaluation
+        Trial values, shape ``(N_patch, P, 1, 1)``, and gradients, shape
+        ``(N_patch, P, 1, d)``, at ``patch_test_space.points``.
+    flux_divergence : jax.Array
+        ``div(A grad w)`` at the same points, shape ``(N_patch, P, 1, 1)``,
+        e.g. from ``evaluate_network_flux_divergence``.
+
+    Returns
+    -------
+    squared_terms : jax.Array
+        ``eta_R,i^2 = h_i^2 ||phi_i^(1/2) rho(w)||^2_(P_i)`` for every patch
+        ``i``, interior and boundary, shape ``(N_patch, 1)``.
+
+    Notes
+    -----
+    The strong residual is ``rho(w) = f + div(A grad w) - beta . grad w - c w``
+    and is weighted by the raw weight ``phi_i``. Edge residuals are omitted,
+    which is exact for trial functions with continuous fluxes.
+    """
+    coefficients = patch_test_space.coefficients
+    strong_residual = (
+        coefficients.source
+        + flux_divergence
+        - coefficients.advection @ trial.gradients.mT
+        - coefficients.reaction * trial.values
+    )
+    local_terms = integrate_cellwise(
+        patch_test_space.raw_weights.values * strong_residual**2,
+        patch_test_space.weights,
+    )
+    diameters = jnp.expand_dims(patch_test_space.family.patch_diameters, axis=-1)
+    return diameters**2 * jnp.squeeze(local_terms, axis=(-3, -2))

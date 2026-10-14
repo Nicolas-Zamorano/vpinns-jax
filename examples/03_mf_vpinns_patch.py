@@ -5,20 +5,28 @@ boundary points included; the test functions are the normalised weights
 ``psi_i = phi_i / S`` of the interior patches. The trial function is a network
 with the homogeneous Dirichlet condition imposed by the ansatz
 ``w = B u_theta``, for the Poisson problem with solution sin(pi x) sin(pi y).
-Three losses are compared:
+Four losses are compared, every combination of a dual norm of the residual
+with or without the residual terms:
 
 - decoupled: ``eta_D^2 = r^T D^{-1} r``, with ``D`` the diagonal of the energy
   Gram matrix ``P`` of the test functions;
 - coupled: ``eta_P^2 = r^T P^{-1} r``, the dual norm of the residual over the
   patch space;
-- estimator: ``eta_P^2 + lambda sum_i eta_R,i^2``, which adds the weighted
-  strong residuals ``eta_R,i = h_i ||phi_i^(1/2) (f + lap w)||``.
+- decoupled_estimator: ``eta_D^2 + lambda sum_i eta_R,i^2``;
+- coupled_estimator: ``eta_P^2 + lambda sum_i eta_R,i^2``;
+
+where the residual terms are the weighted strong residuals
+``eta_R,i = h_i ||phi_i^(1/2) (f + lap w)||``.
 
 For every trained network the script prints the errors, the three estimator
-terms, and the ratios of ``eta_P`` and of the estimator to the energy error,
+terms, and the ratios of ``eta_P`` and of both estimators,
+``(eta_P^2 + lambda eta_R^2)^(1/2)`` and ``(eta_D^2 + lambda eta_R^2)^(1/2)``,
+to the energy error,
 and plots the training quantities, the loss terms, the robustness
-``sqrt(L) / |u - w|_A``, the solution, and the cellwise errors under
-``experiments/``.
+``sqrt(L) / |u - w|_A``, and the exact and network solutions with their
+pointwise error, as surfaces on a uniform grid, under ``experiments/``. The
+errors are measured on a separate, finer mesh of the unit square with the
+degree-5 quadrature, independent of the patches.
 
 Run with:
 
@@ -40,13 +48,16 @@ from jax_fem.diagnostics import (
     l2_error_functional,
     save_plot,
 )
+from jax_fem.element import LagrangeTriangleP1
+from jax_fem.mesh import create_gmsh_unit_square_mesh
 from jax_fem.problem import create_poisson_sin_sin_problem
+from jax_fem.reference_cell import ReferenceTriangle
+from jax_fem.space import create_cell_basis, create_finite_element_space
 
 from vpinns_jax.analysis import (
     compute_network_error,
     compute_solution_norm,
     create_training_monitor,
-    plot_cell_errors,
     plot_loss_terms,
     plot_network_solution,
     plot_robustness,
@@ -93,10 +104,11 @@ def main(
     cells_per_side: int = 8,
     width: int = 32,
     depth: int = 3,
-    num_steps: int = 3000,
+    num_steps: int = 10000,
     learning_rate: float = 1e-3,
     residual_weight: float = 1.0,
     seed: int = 0,
+    error_cells_per_side: int = 64,
 ) -> None:
     """
     Train one network per loss and compare errors and estimator terms.
@@ -117,6 +129,8 @@ def main(
         Weight ``lambda`` of the residual terms in the estimator loss.
     seed : int
         Seed of the initial network weights, shared by all losses.
+    error_cells_per_side : int
+        Resolution of the mesh on which the errors are measured.
     """
     family = create_linf_grid_family(
         np.ones((cells_per_side, cells_per_side), dtype=bool),
@@ -130,8 +144,14 @@ def main(
     diagonal = jnp.diagonal(gram)
     points = space.basis.physical_points
     distance = ExactDistanceFunction("unit_square")
-    l2_norm = compute_solution_norm(space.basis, problem, l2_error_functional)
-    energy_norm = compute_solution_norm(space.basis, problem, energy_error_functional)
+    element = LagrangeTriangleP1(reference_cell=ReferenceTriangle())
+    error_mesh = create_gmsh_unit_square_mesh(error_cells_per_side)
+    error_basis = create_cell_basis(
+        create_finite_element_space(error_mesh, element),
+        element.reference_cell.create_quadrature(5),
+    )
+    l2_norm = compute_solution_norm(error_basis, problem, l2_error_functional)
+    energy_norm = compute_solution_norm(error_basis, problem, energy_error_functional)
 
     def squared_terms(model: eqx.Module) -> SquaredTerms:
         """
@@ -163,14 +183,15 @@ def main(
 
     def loss_terms(model: eqx.Module, loss_name: str) -> Mapping[str, jax.Array]:
         """
-        Named terms of one of the three losses.
+        Named terms of one of the four losses.
 
         Parameters
         ----------
         model : eqx.Module
             Free network.
         loss_name : str
-            ``"decoupled"``, ``"coupled"``, or ``"estimator"``.
+            ``"decoupled"``, ``"coupled"``, ``"decoupled_estimator"``, or
+            ``"coupled_estimator"``.
 
         Returns
         -------
@@ -178,14 +199,14 @@ def main(
             The terms whose sum is the loss.
         """
         terms = squared_terms(model)
-        if loss_name == "decoupled":
-            return {r"$\eta_D^2$": terms.decoupled}
-        if loss_name == "coupled":
-            return {r"$\eta_P^2$": terms.coupled}
-        return {
-            r"$\eta_P^2$": terms.coupled,
-            r"$\lambda \sum_i \eta_{R,i}^2$": residual_weight * terms.residual,
-        }
+        if loss_name.startswith("decoupled"):
+            dual_norm = {r"$\eta_D^2$": terms.decoupled}
+        else:
+            dual_norm = {r"$\eta_P^2$": terms.coupled}
+        if loss_name.endswith("estimator"):
+            residual = residual_weight * terms.residual
+            return dual_norm | {r"$\lambda \sum_i \eta_{R,i}^2$": residual}
+        return dual_norm
 
     def energy_error(model: eqx.Module) -> jax.Array:
         """
@@ -203,7 +224,7 @@ def main(
         """
         return compute_network_error(
             ConstrainedAnsatz(model, distance),
-            space.basis,
+            error_basis,
             problem,
             energy_error_functional,
         )
@@ -218,7 +239,12 @@ def main(
         f"patches, {interior.shape[-1]} test functions, covering bounds "
         f"(c_U2, c_U1) = {family.covering_bounds}."
     )
-    for loss_name in ("decoupled", "coupled", "estimator"):
+    for loss_name in (
+        "decoupled",
+        "coupled",
+        "decoupled_estimator",
+        "coupled_estimator",
+    ):
 
         def run_terms(
             model: eqx.Module, loss_name: str = loss_name
@@ -266,42 +292,36 @@ def main(
             num_steps=num_steps,
             learning_rate=learning_rate,
             monitor=create_training_monitor(run_terms, energy_error, energy_norm),
-            monitor_every=max(1, num_steps // 100),
+            monitor_every=1,
         )
         elapsed = time.perf_counter() - start
 
         trial_network = ConstrainedAnsatz(network, distance)
-        cell_errors = {
-            "$L^2$ error": compute_network_error(
-                trial_network, space.basis, problem, l2_error_functional, reduce=False
-            ),
-            "energy error": compute_network_error(
-                trial_network,
-                space.basis,
-                problem,
-                energy_error_functional,
-                reduce=False,
-            ),
-        }
-        l2 = jnp.sqrt(jnp.sum(cell_errors["$L^2$ error"] ** 2))
-        energy = jnp.sqrt(jnp.sum(cell_errors["energy error"] ** 2))
+        l2 = compute_network_error(
+            trial_network, error_basis, problem, l2_error_functional
+        )
+        energy = compute_network_error(
+            trial_network, error_basis, problem, energy_error_functional
+        )
         terms = SquaredTerms(*(jnp.sqrt(term) for term in squared_terms(network)))
-        estimator = jnp.sqrt(terms.coupled**2 + residual_weight * terms.residual**2)
+        residual_estimate = residual_weight * terms.residual**2
+        coupled_estimator = jnp.sqrt(terms.coupled**2 + residual_estimate)
+        decoupled_estimator = jnp.sqrt(terms.decoupled**2 + residual_estimate)
         relative_l2 = float(l2 / l2_norm)
         print(
-            f"[{loss_name:9s}] {elapsed:6.1f}s | relative L2 {relative_l2:.3e} "
+            f"[{loss_name:19s}] {elapsed:6.1f}s | relative L2 {relative_l2:.3e} "
             f"| energy {float(energy):.3e} | eta_P {float(terms.coupled):.3e} "
             f"| eta_D {float(terms.decoupled):.3e} | eta_R {float(terms.residual):.3e} "
             f"| eta_P / energy {float(terms.coupled / energy):.3f} "
-            f"| estimator / energy {float(estimator / energy):.3f}"
+            f"| coupled estimator / energy {float(coupled_estimator / energy):.3f} "
+            f"| decoupled estimator / energy {float(decoupled_estimator / energy):.3f}"
         )
 
         figures = {
             "training": plot_training_quantities(history),
             "loss_terms": plot_loss_terms(history),
             "robustness": plot_robustness(history),
-            "solution": plot_network_solution(trial_network, family.mesh, problem),
-            "cell_errors": plot_cell_errors(family.mesh, cell_errors),
+            "solution": plot_network_solution(trial_network, error_mesh, problem),
         }
         for name, figure in figures.items():
             save_plot(figure, output_directory / f"{loss_name}_{name}.png")
