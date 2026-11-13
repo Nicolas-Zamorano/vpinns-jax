@@ -103,7 +103,7 @@ def test_loss_terms_plot_the_loss_and_every_term() -> None:
     (axis,) = plot_loss_terms(history).axes
 
     assert [text.get_text() for text in axis.get_legend().get_texts()] == [
-        "loss $L$",
+        r"loss $\mathcal{L}$",
         "first",
         "second",
     ]
@@ -136,7 +136,11 @@ def test_network_solution_surfaces_on_a_uniform_grid(
     grid = np.linspace(0.0, 1.0, 11)
 
     assert len(panels) == 3
-    assert [axis.get_zlabel() for axis in panels] == ["$u$", "$w$", "$|u - w|$"]
+    assert [axis.get_zlabel() for axis in panels] == [
+        "$u$",
+        r"$u_\theta$",
+        r"$|u - u_\theta|$",
+    ]
     # A surface on an 11 x 11 grid has 10 x 10 faces.
     assert exact.get_array().size == 100
     assert np.allclose(

@@ -13,6 +13,7 @@ from vpinns_jax.losses import (
     compute_interpolated_fe_residual,
     diagonal_riesz_loss,
     euclidean_loss,
+    mf_vpinn_loss,
     restrict_to_free,
     riesz_loss,
 )
@@ -104,6 +105,13 @@ def test_riesz_losses_match_dense_formulas(advection_fe) -> None:
         jnp.sum(jnp.ravel(residual) ** 2 / jnp.diagonal(gram)),
     )
     assert jnp.allclose(gram, gram.T)
+
+
+def test_mf_vpinn_loss_weights_residuals_by_inverse_patch_areas() -> None:
+    residual = jnp.array([[1.0], [-2.0], [0.5]])
+    areas = jnp.array([0.25, 0.5, 1.0])
+    expected = (1.0 / 0.25 + 4.0 / 0.5 + 0.25 / 1.0) / 3.0
+    assert jnp.allclose(mf_vpinn_loss(residual, areas), expected)
 
 
 def test_riesz_loss_of_interpolated_trial_is_energy_distance_to_galerkin(

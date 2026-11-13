@@ -6,6 +6,8 @@ from vpinns_jax.models.ansatz import FourierFeatureMLP, MultiLayerPerceptron
 from vpinns_jax.models.boundary import (
     ConstrainedAnsatz,
     ExactDistanceFunction,
+    TransfiniteLift,
+    WachspressLift,
     interpolate_network,
 )
 from vpinns_jax.models.evaluation import (
@@ -23,6 +25,8 @@ __all__ = [
     "evaluate_network",
     "evaluate_network_flux_divergence",
     "ExactDistanceFunction",
+    "TransfiniteLift",
+    "WachspressLift",
     "ConstrainedAnsatz",
     "interpolate_network",
 ]

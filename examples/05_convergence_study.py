@@ -160,7 +160,7 @@ def _run_level(
         """
         coupled, residual = squared_terms(model)
         return {
-            r"$\eta_P^2$": coupled,
+            r"$\eta_\psi^2$": coupled,
             r"$\lambda \sum_i \eta_{R,i}^2$": residual_weight * residual,
         }
 

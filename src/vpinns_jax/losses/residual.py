@@ -222,14 +222,18 @@ def compute_meshfree_patch_residual_terms(
     Returns
     -------
     squared_terms : jax.Array
-        ``eta_R,i^2 = h_i^2 ||phi_i^(1/2) rho(w)||^2_(P_i)`` for every patch
-        ``i``, interior and boundary, shape ``(N_patch, 1)``.
+        ``rho_i(w)^2 = c_2(P_i)^2 h_i^2 ||phi_i^(1/2) R(w)||^2_(P_i)`` for
+        every patch ``i``, interior and boundary, shape ``(N_patch, 1)``;
+        their sum is ``rho(w)^2``.
 
     Notes
     -----
-    The strong residual is ``rho(w) = f + div(A grad w) - beta . grad w - c w``
-    and is weighted by the raw weight ``phi_i``. Edge residuals are omitted,
-    which is exact for trial functions with continuous fluxes.
+    The strong residual is ``R(w) = f + div(A grad w) - beta . grad w - c w``,
+    which is ``f + Lap w`` for the Poisson problem, and is weighted by the
+    raw weight ``phi_i``. The constants ``c_2(P_i)`` of inequality (W2) come
+    from the family. Edge residuals are omitted, which is exact for trial
+    functions with continuous fluxes. The terms are finite only if
+    ``Lap w`` is square integrable against every ``phi_i``, hypothesis (R).
     """
     coefficients = patch_test_space.coefficients
     strong_residual = (
@@ -242,5 +246,6 @@ def compute_meshfree_patch_residual_terms(
         patch_test_space.raw_weights.values * strong_residual**2,
         patch_test_space.weights,
     )
-    diameters = jnp.expand_dims(patch_test_space.family.patch_diameters, axis=-1)
-    return diameters**2 * jnp.squeeze(local_terms, axis=(-3, -2))
+    family = patch_test_space.family
+    lengths = jnp.expand_dims(family.poincare_constants * family.patch_diameters, -1)
+    return lengths**2 * jnp.squeeze(local_terms, axis=(-3, -2))

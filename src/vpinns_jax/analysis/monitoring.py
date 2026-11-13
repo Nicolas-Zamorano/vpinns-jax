@@ -31,6 +31,11 @@ class TrainingRecord(NamedTuple):
     robustness : jax.Array
         ``sqrt(L) / |u - w|_A``, the ratio of the two relative quantities,
         shape ``(...,)``.
+    estimators : Mapping[str, jax.Array]
+        Named squared error estimators that are not part of the loss, such
+        as ``eta_psi^2`` and ``rho^2`` for the bound checks of
+        ``compute_bound_ratios``, each of shape ``(...,)``; empty unless the
+        monitor computes them.
 
     Notes
     -----
@@ -47,12 +52,14 @@ class TrainingRecord(NamedTuple):
     relative_loss: jax.Array
     relative_energy_error: jax.Array
     robustness: jax.Array
+    estimators: Mapping[str, jax.Array] = {}
 
 
 def create_training_monitor(
     loss_terms: Callable[[eqx.Module], Mapping[str, jax.Array]],
     energy_error: Callable[[eqx.Module], jax.Array],
     solution_energy_norm: jax.Array,
+    estimators: Callable[[eqx.Module], Mapping[str, jax.Array]] | None = None,
 ) -> Callable[[eqx.Module], TrainingRecord]:
     """
     Monitor recording the loss, its terms, and the energy error of a model.
@@ -67,6 +74,10 @@ def create_training_monitor(
         e.g. through ``compute_network_error`` or ``compute_energy_error``.
     solution_energy_norm : jax.Array
         ``|u|_A``, e.g. from ``compute_solution_norm``.
+    estimators : Callable[[eqx.Module], Mapping[str, jax.Array]] | None
+        Named squared error estimators of the model recorded besides the
+        loss, e.g. every estimator of the paper for the bound checks along
+        the training; ``None`` records none.
 
     Returns
     -------
@@ -106,6 +117,7 @@ def create_training_monitor(
             relative_loss=root_loss / solution_energy_norm,
             relative_energy_error=error / solution_energy_norm,
             robustness=root_loss / error,
+            estimators={} if estimators is None else dict(estimators(model)),
         )
 
     return monitor

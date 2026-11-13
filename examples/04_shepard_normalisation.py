@@ -1,17 +1,24 @@
 """Why the patch weights must be normalised: a fixed error under refinement.
 
-On the unit square, the error ``e = u - w = sin(pi x) sin(pi y)`` is held fixed,
-so ``|grad e| = pi / sqrt(2)`` for every grid, and the residual of ``w`` is
-``r_i = (grad e, grad psi_i)``. For the l^inf cone families with spacing
-``1/n``, the script computes, without any training,
+The problem is the advection-diffusion-reaction problem
+``-div(A grad u) + beta . grad u + c u = f`` of
+``create_simple_elliptic_problem`` on the unit square, with nonhomogeneous
+Dirichlet data ``g``. The trial function ``w = g_bar``, the transfinite
+interpolation of ``g`` into the square, which is the ansatz
+``w = B u_theta + g_bar`` with ``u_theta = 0``, is held fixed. Its error
+``e = u - w`` lies in ``H^1_0`` and is the same for every grid, so its energy
+norm ``|e|_A`` is computed once, on a fine mesh, and the residual of ``w`` is
+``r_i = a(w, psi_i) - l(psi_i) = -a(e, psi_i)``. For the l^inf cone families
+with spacing ``1/n``, the script computes, without any training,
 
-- ``eta_P / |grad e|`` with the normalised weights ``psi_i = phi_i / S``, which
-  settles at a fixed fraction of the error;
-- the same with the raw weights ``phi_i``, which halves with every refinement,
-  so a bound built on it cannot hold uniformly;
-- ``eta_D / |grad e|``, the decoupled dual norm with the normalised weights,
+- ``eta_P / |e|_A`` with the normalised weights ``psi_i = phi_i / S``, which
+  settles at a fixed fraction of the error once the grid resolves it;
+- the same with the raw weights ``phi_i``, which then halves with every
+  refinement, so a bound built on it cannot hold uniformly;
+- ``eta_D / |e|_A``, the decoupled dual norm with the normalised weights,
   which also decays with ``h``;
-- ``eta_R / |grad e|``, with ``eta_R,i = h_i c_2 ||phi_i^(1/2) lap e||`` and
+- ``eta_R / |e|_A``, with ``eta_R,i = h_i c_2 ||phi_i^(1/2) rho(w)||``, the
+  strong residual ``rho(w) = f + div(A grad w) - beta . grad w - c w``, and
   ``c_2 = 1 / pi``, the approximability term, which is ``O(h)``.
 
 The ratios are plotted against ``n`` and saved under ``experiments/``.
@@ -24,16 +31,19 @@ Run with:
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-from jax_fem.diagnostics import create_timestamped_output_directory, save_plot
-from jax_fem.problem import (
-    EllipticProblem,
-    constant_scalar_coefficient,
-    constant_tensor_coefficient,
-    constant_vector_coefficient,
-    create_full_boundary_dirichlet_condition,
+from jax_fem.diagnostics import (
+    create_timestamped_output_directory,
+    energy_error_functional,
+    save_plot,
 )
+from jax_fem.element import LagrangeTriangleP1
+from jax_fem.mesh import create_gmsh_unit_square_mesh
+from jax_fem.problem import EllipticProblem, create_simple_elliptic_problem
+from jax_fem.reference_cell import ReferenceTriangle
+from jax_fem.space import create_cell_basis, create_finite_element_space
+from matplotlib.ticker import NullFormatter
 
-from vpinns_jax.analysis import line_style, show_grid
+from vpinns_jax.analysis import compute_network_error, line_style, show_grid
 from vpinns_jax.losses import (
     compute_patch_residual,
     compute_patch_residual_terms,
@@ -41,7 +51,12 @@ from vpinns_jax.losses import (
     restrict_to_free,
     riesz_loss,
 )
-from vpinns_jax.models import evaluate_network, evaluate_network_flux_divergence
+from vpinns_jax.models import (
+    Network,
+    TransfiniteLift,
+    evaluate_network,
+    evaluate_network_flux_divergence,
+)
 from vpinns_jax.test_spaces import (
     PatchTestSpace,
     create_linf_grid_family,
@@ -49,31 +64,16 @@ from vpinns_jax.test_spaces import (
 )
 
 
-def error_function(x: jnp.ndarray) -> jnp.ndarray:
+def _dual_norms(space: PatchTestSpace, trial_function: Network) -> tuple[float, float]:
     """
-    The fixed error ``e = sin(pi x) sin(pi y)``.
-
-    Parameters
-    ----------
-    x : jnp.ndarray
-        Point, shape ``(2,)``.
-
-    Returns
-    -------
-    value : jnp.ndarray
-        ``e(x)``, shape ``()``.
-    """
-    return jnp.sin(jnp.pi * x[0]) * jnp.sin(jnp.pi * x[1])
-
-
-def _dual_norms(space: PatchTestSpace) -> tuple[float, float]:
-    """
-    Coupled and decoupled dual norms of the residual of the fixed error.
+    Coupled and decoupled dual norms of the residual of a fixed trial function.
 
     Parameters
     ----------
     space : PatchTestSpace
-        Patch test space of a problem with ``f = 0`` and ``A = I``.
+        Patch test space.
+    trial_function : Network
+        The fixed trial function ``w``.
 
     Returns
     -------
@@ -83,7 +83,7 @@ def _dual_norms(space: PatchTestSpace) -> tuple[float, float]:
         ``eta_D = (r^T D^{-1} r)^(1/2)``.
     """
     interior = space.family.interior_patches
-    trial = evaluate_network(error_function, space.basis.physical_points)
+    trial = evaluate_network(trial_function, space.basis.physical_points)
     residual = jnp.take(compute_patch_residual(space, trial), interior, axis=-2)
     gram = restrict_to_free(space.gram, interior)
     coupled = jnp.sqrt(riesz_loss(residual, jnp.linalg.cholesky(gram)))
@@ -91,16 +91,20 @@ def _dual_norms(space: PatchTestSpace) -> tuple[float, float]:
     return float(coupled), float(decoupled)
 
 
-def _residual_estimate(space: PatchTestSpace, problem: EllipticProblem) -> float:
+def _residual_estimate(
+    space: PatchTestSpace, problem: EllipticProblem, trial_function: Network
+) -> float:
     """
-    Residual term of the fixed error with ``c_2 = 1 / pi``.
+    Residual term of a fixed trial function with ``c_2 = 1 / pi``.
 
     Parameters
     ----------
     space : PatchTestSpace
         Patch test space.
     problem : EllipticProblem
-        Problem with ``f = 0`` and ``A = I``.
+        Problem providing the diffusion of the strong residual.
+    trial_function : Network
+        The fixed trial function ``w``.
 
     Returns
     -------
@@ -108,15 +112,18 @@ def _residual_estimate(space: PatchTestSpace, problem: EllipticProblem) -> float
         ``(sum_i eta_R,i^2)^(1/2)``.
     """
     points = space.basis.physical_points
-    trial = evaluate_network(error_function, points)
+    trial = evaluate_network(trial_function, points)
     flux_divergence = evaluate_network_flux_divergence(
-        error_function, problem.diffusion, points
+        trial_function, problem.diffusion, points
     )
     terms = compute_patch_residual_terms(space, trial, flux_divergence)
     return float(jnp.sqrt(jnp.sum(terms)) / jnp.pi)
 
 
-def main(grid_sizes: tuple[int, ...] = (4, 8, 16, 32)) -> None:
+def main(
+    grid_sizes: tuple[int, ...] = (4, 8, 16, 32, 64),
+    error_cells_per_side: int = 64,
+) -> None:
     """
     Print and plot the estimator ratios for a fixed error.
 
@@ -124,43 +131,46 @@ def main(grid_sizes: tuple[int, ...] = (4, 8, 16, 32)) -> None:
     ----------
     grid_sizes : tuple[int, ...]
         Numbers of grid squares per side.
+    error_cells_per_side : int
+        Resolution of the mesh on which ``|e|_A`` is measured.
     """
-    error_norm = float(jnp.pi / jnp.sqrt(2.0))
+    element = LagrangeTriangleP1(reference_cell=ReferenceTriangle())
+    error_mesh = create_gmsh_unit_square_mesh(error_cells_per_side)
+    error_basis = create_cell_basis(
+        create_finite_element_space(error_mesh, element),
+        element.reference_cell.create_quadrature(5),
+    )
+    # The mesh only tags the boundary of the problem's Dirichlet condition; the
+    # patch spaces use the coefficient functions and the lift the data.
+    problem = create_simple_elliptic_problem(error_mesh)
+    (dirichlet_condition,) = problem.dirichlet_conditions
+    lift = TransfiniteLift(dirichlet_condition.value)
+    error_norm = float(
+        compute_network_error(lift, error_basis, problem, energy_error_functional)
+    )
+
     labels = ("eta_P (psi)", "eta_P (phi)", "eta_D (psi)", "eta_R")
     rows = []
+    print(f"Fixed trial w = g_bar: |e|_A = |u - w|_A = {error_norm:.4f}")
     print(
-        "    n"
-        + "".join(f"{label:>14s}" for label in labels)
-        + "   (ratios to |grad e|)"
+        "    n" + "".join(f"{label:>14s}" for label in labels) + "   (ratios to |e|_A)"
     )
     for cells_per_side in grid_sizes:
         family = create_linf_grid_family(
             np.ones((cells_per_side, cells_per_side), dtype=bool),
             spacing=1.0 / cells_per_side,
         )
-        # With f = 0 and A = I, the residual of the trial e is (grad e, grad psi_i).
-        problem = EllipticProblem(
-            diffusion=constant_tensor_coefficient(jnp.eye(2)),
-            advection=constant_vector_coefficient(jnp.zeros(2)),
-            reaction=constant_scalar_coefficient(0.0),
-            source=constant_scalar_coefficient(0.0),
-            dirichlet_conditions=(
-                create_full_boundary_dirichlet_condition(
-                    family.mesh, constant_scalar_coefficient(0.0)
-                ),
-            ),
-        )
         normalised = create_patch_test_space(family, problem)
         raw = create_patch_test_space(family, problem, normalise=False)
-        coupled, decoupled = _dual_norms(normalised)
-        raw_coupled, _ = _dual_norms(raw)
+        coupled, decoupled = _dual_norms(normalised, lift)
+        raw_coupled, _ = _dual_norms(raw, lift)
         ratios = (
             np.array(
                 [
                     coupled,
                     raw_coupled,
                     decoupled,
-                    _residual_estimate(normalised, problem),
+                    _residual_estimate(normalised, problem, lift),
                 ]
             )
             / error_norm
@@ -180,8 +190,10 @@ def main(grid_sizes: tuple[int, ...] = (4, 8, 16, 32)) -> None:
         axis.loglog(
             grid_sizes, table[:, column], marker="o", label=label, **line_style(column)
         )
+    axis.set_xticks(grid_sizes, labels=[str(n) for n in grid_sizes])
+    axis.xaxis.set_minor_formatter(NullFormatter())
     axis.set_xlabel("n (grid squares per side)")
-    axis.set_ylabel(r"ratio to $\|\nabla e\|$")
+    axis.set_ylabel(r"ratio to $\|e\|_A$")
     axis.set_title("Fixed error under refinement")
     axis.legend()
     show_grid(axis)

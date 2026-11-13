@@ -12,6 +12,8 @@ dependencies = [
     "jax-fem",
     "matplotlib>=3.11.1",
     "optax>=0.2.8",
+    "scipy>=1.18.0",
+    "tqdm>=4.70.1",
 ]
 
 [build-system]

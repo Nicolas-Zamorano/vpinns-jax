@@ -14,6 +14,10 @@ from vpinns_jax.test_spaces.meshfree_space import (
     MeshfreePatchFamily,
     create_meshfree_patch_family,
 )
+from vpinns_jax.test_spaces.poincare_constants import (
+    compute_linf_poincare_constants,
+    round_up,
+)
 
 # Cells around a grid point by their lower-left corner, counterclockwise from
 # the upper right.
@@ -32,6 +36,45 @@ _NEIGHBOUR_OFFSETS = (
     (0, -1),
     (1, -1),
 )
+# Configurations of the patches by the number of boundary lines through their
+# centre: interior, side, corner.
+_CONFIGURATIONS = ("interior", "side", "corner")
+# Decimals kept when the computed constants c_2 h / s are rounded up.
+_CONSTANT_DECIMALS = 3
+
+
+def linf_poincare_constants(refinement: int = 32) -> np.ndarray:
+    """
+    Constants ``c_2`` of (W2) of the interior, side, and corner patches.
+
+    Parameters
+    ----------
+    refinement : int
+        Number of mesh cells per grid spacing of the eigenvalue problems.
+
+    Returns
+    -------
+    constants : np.ndarray
+        ``c_2`` of each configuration, shape ``(3,)``.
+
+    Notes
+    -----
+    ``c_2 h / s`` is computed with ``compute_linf_poincare_constants`` and
+    rounded up in the third decimal: the P1 eigenvalue problems approximate
+    the constants from below, and the rounded values bound them for the
+    default refinement. The diameters are ``h = 2 sqrt(2) s``, ``sqrt(5) s``
+    and ``sqrt(2) s``.
+    """
+    constants = [
+        compute_linf_poincare_constants(configuration, refinement)
+        for configuration in _CONFIGURATIONS
+    ]
+    return np.array(
+        [
+            round_up(constant.weighted, _CONSTANT_DECIMALS) / constant.diameter
+            for constant in constants
+        ]
+    )
 
 
 def _linf_weight(
@@ -85,7 +128,9 @@ def _grid_point_index(
     return np.where(valid, j * (cells_per_side + 1) + i, 0), valid
 
 
-def create_linf_vertex_family(cells_per_side: int) -> MeshfreePatchFamily:
+def create_linf_vertex_family(
+    cells_per_side: int, *, poincare_refinement: int = 32
+) -> MeshfreePatchFamily:
     """
     Family of ``l^inf`` cones centred at the grid points of the unit square.
 
@@ -93,6 +138,9 @@ def create_linf_vertex_family(cells_per_side: int) -> MeshfreePatchFamily:
     ----------
     cells_per_side : int
         Number of grid cells per side ``n``; the spacing is ``s = 1 / n``.
+    poincare_refinement : int
+        Number of mesh cells per grid spacing of the eigenvalue problems that
+        give the constants ``c_2`` of (W2).
 
     Returns
     -------
@@ -113,10 +161,21 @@ def create_linf_vertex_family(cells_per_side: int) -> MeshfreePatchFamily:
     sixteen for an interior grid point, so ``psi_i = phi_i / S`` is smooth on
     each of them, and the triangles of two patches agree where the patches
     overlap.
+
+    The constants ``c_2`` of (W2) are computed numerically on the three
+    reference configurations (``linf_poincare_constants``); they are scale
+    invariant, hence the same for every ``n``. With the default refinement,
+    ``c_2 h = 0.470 s`` inside and on a side and ``0.361 s`` at a corner,
+    against the a priori bound ``2 sqrt(2) s / pi = 0.900 s`` of a concave
+    weight on the square of side ``2 s``.
     """
     spacing = 1.0 / cells_per_side
     grid_j, grid_i = np.divmod(np.arange((cells_per_side + 1) ** 2), cells_per_side + 1)
     grid_points = spacing * np.stack((grid_i, grid_j), axis=-1).astype(float)
+    # Boundary lines through each grid point: 0 inside, 1 on a side, 2 at a corner.
+    boundary_sides = ((grid_i == 0) | (grid_i == cells_per_side)).astype(int) + (
+        (grid_j == 0) | (grid_j == cells_per_side)
+    )
 
     triangles = []
     triangle_mask = []
@@ -150,8 +209,6 @@ def create_linf_vertex_family(cells_per_side: int) -> MeshfreePatchFamily:
         triangle_mask=np.stack(triangle_mask, axis=-1),
         neighbours=np.stack([index for index, _ in neighbours], axis=-1),
         neighbour_mask=np.stack([valid for _, valid in neighbours], axis=-1),
-        boundary_patch_mask=(grid_i == 0)
-        | (grid_i == cells_per_side)
-        | (grid_j == 0)
-        | (grid_j == cells_per_side),
+        boundary_patch_mask=boundary_sides > 0,
+        poincare_constants=linf_poincare_constants(poincare_refinement)[boundary_sides],
     )

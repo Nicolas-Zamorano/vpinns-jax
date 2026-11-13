@@ -71,6 +71,10 @@ from vpinns_jax.models import MultiLayerPerceptron, interpolate_network
 from vpinns_jax.solvers import train_adam
 from vpinns_jax.test_spaces import FETestSpace, create_fe_test_space
 
+# The energy norm of this problem is not that of the Poisson problem.
+_ERROR_NORM = r"\|u - u_\theta\|_A"
+_SOLUTION_NORM = r"\|u\|_A"
+
 
 def _galerkin_solution(fe: FETestSpace) -> FiniteElementFunction:
     """
@@ -278,9 +282,11 @@ def main(
         )
 
         figures = {
-            "training": plot_training_quantities(history),
+            "training": plot_training_quantities(
+                history, error_norm=_ERROR_NORM, solution_norm=_SOLUTION_NORM
+            ),
             "loss_terms": plot_loss_terms(history),
-            "robustness": plot_robustness(history),
+            "robustness": plot_robustness(history, error_norm=_ERROR_NORM),
             "cell_errors": plot_cell_errors(
                 mesh,
                 {

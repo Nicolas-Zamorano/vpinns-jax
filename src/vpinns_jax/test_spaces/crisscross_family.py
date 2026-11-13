@@ -138,11 +138,21 @@ def create_crisscross_family(cells_per_side: int) -> MeshfreePatchFamily:
     centre obtained by cutting every cell along both diagonals: eight for an
     interior grid point, four for a cell or a point on a side, and two at a
     corner. Every weight is affine on each of them.
+
+    The odd reflection of a half or quarter diamond across its Dirichlet
+    sides is the full diamond, of diameter ``2 s``, carrying the full concave
+    weight, so the constants of (W2) are ``c_2 = 1 / pi`` for the diamonds,
+    the cells, and the half diamonds, and ``c_2 = sqrt(2) / pi`` for the
+    quarter diamonds, whose diameter is ``sqrt(2) s``.
     """
     spacing = 1.0 / cells_per_side
     grid_j, grid_i = np.divmod(np.arange((cells_per_side + 1) ** 2), cells_per_side + 1)
     cell_j, cell_i = np.divmod(np.arange(cells_per_side**2), cells_per_side)
     grid_points = spacing * np.stack((grid_i, grid_j), axis=-1).astype(float)
+    # Boundary lines through each grid point: 0 inside, 1 on a side, 2 at a corner.
+    boundary_sides = ((grid_i == 0) | (grid_i == cells_per_side)).astype(int) + (
+        (grid_j == 0) | (grid_j == cells_per_side)
+    )
     cell_centres = spacing * (np.stack((cell_i, cell_j), axis=-1) + 0.5)
 
     # Two triangles per quadrant, between the point, a neighbouring grid
@@ -221,12 +231,12 @@ def create_crisscross_family(cells_per_side: int) -> MeshfreePatchFamily:
             axis=-2,
         ),
         boundary_patch_mask=np.concatenate(
+            (boundary_sides > 0, np.zeros(cell_i.shape, dtype=bool)), axis=-1
+        ),
+        poincare_constants=np.concatenate(
             (
-                (grid_i == 0)
-                | (grid_i == cells_per_side)
-                | (grid_j == 0)
-                | (grid_j == cells_per_side),
-                np.zeros(cell_i.shape, dtype=bool),
+                np.where(boundary_sides == 2, np.sqrt(2.0), 1.0) / np.pi,
+                np.full(cell_i.shape, 1.0 / np.pi),
             ),
             axis=-1,
         ),

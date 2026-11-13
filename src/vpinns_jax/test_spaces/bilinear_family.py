@@ -31,6 +31,11 @@ _NEIGHBOUR_OFFSETS = (
     (0, -1),
     (1, -1),
 )
+# Constant c_2 of (W2) of the interior, side, and corner patches: c_2 h = 2 sqrt(2) s
+# / pi for each, with h = 2 sqrt(2) s, sqrt(5) s, and sqrt(2) s, respectively.
+_POINCARE_CONSTANTS = np.array(
+    [1.0 / np.pi, 2.0 * np.sqrt(2.0) / (np.sqrt(5.0) * np.pi), 2.0 / np.pi]
+)
 
 
 def _bilinear_weight(
@@ -112,10 +117,20 @@ def create_bilinear_family(cells_per_side: int) -> MeshfreePatchFamily:
     patch split each of its cells along the diagonal through its lower-left
     corner, the same diagonal for every patch, so the triangles of two
     patches agree where the patches overlap.
+
+    The weights are log-concave, as products of concave factors, and the odd
+    reflection of a side or corner patch across its Dirichlet sides is the
+    full square of side ``2 s`` with the full weight, so the constants of
+    (W2) are ``c_2 h = 2 sqrt(2) s / pi`` for every patch, as for the
+    ``l^inf`` family.
     """
     spacing = 1.0 / cells_per_side
     grid_j, grid_i = np.divmod(np.arange((cells_per_side + 1) ** 2), cells_per_side + 1)
     grid_points = spacing * np.stack((grid_i, grid_j), axis=-1).astype(float)
+    # Boundary lines through each grid point: 0 inside, 1 on a side, 2 at a corner.
+    boundary_sides = ((grid_i == 0) | (grid_i == cells_per_side)).astype(int) + (
+        (grid_j == 0) | (grid_j == cells_per_side)
+    )
 
     triangles = []
     triangle_mask = []
@@ -150,8 +165,6 @@ def create_bilinear_family(cells_per_side: int) -> MeshfreePatchFamily:
         triangle_mask=np.stack(triangle_mask, axis=-1),
         neighbours=np.stack([index for index, _ in neighbours], axis=-1),
         neighbour_mask=np.stack([valid for _, valid in neighbours], axis=-1),
-        boundary_patch_mask=(grid_i == 0)
-        | (grid_i == cells_per_side)
-        | (grid_j == 0)
-        | (grid_j == cells_per_side),
+        boundary_patch_mask=boundary_sides > 0,
+        poincare_constants=_POINCARE_CONSTANTS[boundary_sides],
     )

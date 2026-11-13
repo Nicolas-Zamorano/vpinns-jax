@@ -32,6 +32,10 @@ _OKABE_ITO = (
     "#D55E00",
     "#CC79A7",
 )
+# Norm of the error and of the solution in the labels: the energy norm of the
+# Poisson problem, in the notation of the paper.
+_ERROR_NORM = r"\|\nabla(u - u_\theta)\|_0"
+_SOLUTION_NORM = r"\|\nabla u\|_0"
 _LINESTYLES = (
     "-",
     "--",
@@ -124,7 +128,12 @@ def _training_record(history: TrainingHistory) -> TrainingRecord:
     return history.monitored
 
 
-def plot_training_quantities(history: TrainingHistory) -> Figure:
+def plot_training_quantities(
+    history: TrainingHistory,
+    *,
+    error_norm: str = _ERROR_NORM,
+    solution_norm: str = _SOLUTION_NORM,
+) -> Figure:
     """
     Loss, relative loss, and relative energy error over the training steps.
 
@@ -132,14 +141,19 @@ def plot_training_quantities(history: TrainingHistory) -> Figure:
     ----------
     history : TrainingHistory
         History of a training with a ``create_training_monitor`` monitor.
+    error_norm : str
+        LaTeX of the energy norm of the error, without dollar signs; by
+        default ``||grad(u - u_theta)||_0``, that of the Poisson problem.
+    solution_norm : str
+        LaTeX of the energy norm of the exact solution, without dollar signs.
 
     Returns
     -------
     figure : Figure
         Two panels sharing the step axis, from zero to the number of steps:
         the loss ``L`` at every step, and the relative loss
-        ``sqrt(L) / |u|_A`` with the relative energy error
-        ``|u - w|_A / |u|_A`` at the monitored steps.
+        ``sqrt(L) / ||grad u||_0`` with the relative energy error
+        ``||grad(u - u_theta)||_0 / ||grad u||_0`` at the monitored steps.
 
     Notes
     -----
@@ -153,7 +167,9 @@ def plot_training_quantities(history: TrainingHistory) -> Figure:
     figure, (loss_axis, relative_axis) = pyplot.subplots(
         2, 1, figsize=(8.0, 7.0), sharex=True, constrained_layout=True
     )
-    loss_axis.semilogy(np.asarray(history.loss), label="loss $L$", **line_style(0))
+    loss_axis.semilogy(
+        np.asarray(history.loss), label=r"loss $\mathcal{L}$", **line_style(0)
+    )
     loss_axis.set_ylabel("loss")
     loss_axis.set_title("Loss")
     loss_axis.set_xlim(0, history.loss.shape[-1])
@@ -162,17 +178,17 @@ def plot_training_quantities(history: TrainingHistory) -> Figure:
     relative_axis.semilogy(
         steps,
         np.asarray(record.relative_loss),
-        label=r"relative loss $\sqrt{L} / \|u\|_A$",
+        label=rf"relative loss $\sqrt{{\mathcal{{L}}}} / {solution_norm}$",
         **line_style(1),
     )
     relative_axis.semilogy(
         steps,
         np.asarray(record.relative_energy_error),
-        label=r"relative energy error $\|u - w\|_A / \|u\|_A$",
+        label=rf"relative energy error ${error_norm} / {solution_norm}$",
         **line_style(2),
     )
     relative_axis.set_xlabel("step")
-    relative_axis.set_ylabel(r"relative to $\|u\|_A$")
+    relative_axis.set_ylabel(rf"relative to ${solution_norm}$")
     relative_axis.set_title("Relative loss and relative energy error")
     relative_axis.legend()
     for axis in (loss_axis, relative_axis):
@@ -200,7 +216,9 @@ def plot_loss_terms(history: TrainingHistory) -> Figure:
     steps = np.asarray(history.monitored_steps)
     pyplot = _pyplot()
     figure, axis = pyplot.subplots(figsize=(8.0, 5.0), constrained_layout=True)
-    axis.semilogy(steps, np.asarray(record.loss), label="loss $L$", **line_style(0))
+    axis.semilogy(
+        steps, np.asarray(record.loss), label=r"loss $\mathcal{L}$", **line_style(0)
+    )
     for index, (name, values) in enumerate(record.terms.items(), start=1):
         axis.semilogy(steps, np.asarray(values), label=name, **line_style(index))
     axis.set_xlabel("step")
@@ -212,7 +230,9 @@ def plot_loss_terms(history: TrainingHistory) -> Figure:
     return figure
 
 
-def plot_robustness(history: TrainingHistory) -> Figure:
+def plot_robustness(
+    history: TrainingHistory, *, error_norm: str = _ERROR_NORM
+) -> Figure:
     """
     Ratio of the relative loss to the relative energy error over training.
 
@@ -220,12 +240,16 @@ def plot_robustness(history: TrainingHistory) -> Figure:
     ----------
     history : TrainingHistory
         History of a training with a ``create_training_monitor`` monitor.
+    error_norm : str
+        LaTeX of the energy norm of the error, without dollar signs; by
+        default ``||grad(u - u_theta)||_0``, that of the Poisson problem.
 
     Returns
     -------
     figure : Figure
-        ``sqrt(L) / |u - w|_A`` at the monitored steps, with a reference line
-        at one and the step axis from zero to the number of steps.
+        ``sqrt(L) / ||grad(u - u_theta)||_0`` at the monitored steps, with a
+        reference line at one and the step axis from zero to the number of
+        steps.
 
     Notes
     -----
@@ -239,12 +263,12 @@ def plot_robustness(history: TrainingHistory) -> Figure:
     axis.semilogy(
         np.asarray(history.monitored_steps),
         np.asarray(record.robustness),
-        label=r"$\sqrt{L} / \|u - w\|_A$",
+        label=rf"$\sqrt{{\mathcal{{L}}}} / {error_norm}$",
         **line_style(0),
     )
     axis.axhline(1.0, label="1", linewidth=1.0, **line_style(1))
     axis.set_xlabel("step")
-    axis.set_ylabel(r"$\sqrt{L} / \|u - w\|_A$")
+    axis.set_ylabel(rf"$\sqrt{{\mathcal{{L}}}} / {error_norm}$")
     axis.set_title("Robustness: relative loss / relative energy error")
     axis.set_xlim(0, history.loss.shape[-1])
     axis.legend()
@@ -345,9 +369,9 @@ def plot_network_solution(
     Returns
     -------
     figure : Figure
-        Three 3D panels over the bounding box of the domain: ``u`` and ``w``
-        with the range of ``u`` as vertical and color limits, and
-        ``|u - w|`` from zero to its maximum.
+        Three 3D panels over the bounding box of the domain: ``u`` and
+        ``u_theta`` with the range of ``u`` as vertical and color limits, and
+        ``|u - u_theta|`` from zero to its maximum.
 
     Notes
     -----
@@ -355,7 +379,7 @@ def plot_network_solution(
     the domain, independent of the mesh, so the plot shows the network
     itself rather than a mesh interpolant. Grid points outside the domain,
     located through the mesh triangulation, are left blank, and the parts of
-    ``w`` beyond the range of ``u`` are clipped.
+    ``u_theta`` beyond the range of ``u`` are clipped.
     """
     x, y, exact, approximation = _evaluate_on_grid(
         network, mesh, problem, points_per_side
@@ -365,8 +389,8 @@ def plot_network_solution(
     error_range = (0.0, float(np.nanmax(error)))
     panels = (
         ("Exact solution", "$u$", exact, exact_range),
-        ("VPINN solution", "$w$", approximation, exact_range),
-        ("Pointwise absolute error", "$|u - w|$", error, error_range),
+        ("Network solution", r"$u_\theta$", approximation, exact_range),
+        ("Pointwise absolute error", r"$|u - u_\theta|$", error, error_range),
     )
     pyplot = _pyplot()
     figure = pyplot.figure(figsize=(18.0, 5.5), constrained_layout=True)

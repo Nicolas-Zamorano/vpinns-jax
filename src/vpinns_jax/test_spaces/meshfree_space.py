@@ -53,6 +53,11 @@ class MeshfreePatchFamily:
         ``True`` for real neighbours, shape ``(N_patch, C)``.
     patch_diameters : jax.Array
         Diameter ``h_i`` of each patch, shape ``(N_patch,)``.
+    patch_areas : jax.Array
+        Area ``|P_i|`` of each patch, shape ``(N_patch,)``.
+    poincare_constants : jax.Array
+        Constant ``c_2(P_i)`` of the weighted Poincare-Friedrichs inequality
+        (W2) of each patch, shape ``(N_patch,)``.
     boundary_patch_mask : jax.Array
         ``True`` for the boundary patches ``I_Gamma``, shape ``(N_patch,)``.
     interior_patches : jax.Array
@@ -67,6 +72,18 @@ class MeshfreePatchFamily:
     no global mesh. The neighbours give the covering function
     ``S = sum_j phi_j`` on ``P_i`` and the nonzero Gram matrix entries of row
     ``i``.
+
+    Inequality (W2) reads
+    ``||phi_i^(1/2) (v - v_i)||_(P_i) <= c_2(P_i) h_i ||phi_i^(1/2) grad v||_(P_i)``
+    for ``v`` in ``H^1_0``, where ``v_i`` is the ``phi_i``-weighted mean of
+    ``v`` for an interior patch and zero for a boundary patch; the constants
+    enter the residual estimator ``rho``. For a convex patch with a concave
+    weight, hence log-concave, the weighted Poincare inequality of Ferone,
+    Nitsch and Trombetti (2012) gives ``c_2(P_i) h_i = diam(P_i) / pi``. For
+    a boundary patch whose odd reflection across its Dirichlet sides is a
+    convex patch ``P~_i`` carrying the evenly reflected, concave weight, the
+    reflected ``v`` has zero weighted mean and the same inequality on
+    ``P~_i`` gives ``c_2(P_i) h_i = diam(P~_i) / pi``.
     """
 
     weight: PatchWeight
@@ -77,6 +94,8 @@ class MeshfreePatchFamily:
     neighbours: jax.Array
     neighbour_mask: jax.Array
     patch_diameters: jax.Array
+    patch_areas: jax.Array
+    poincare_constants: jax.Array
     boundary_patch_mask: jax.Array
     interior_patches: jax.Array
 
@@ -102,9 +121,11 @@ def create_meshfree_patch_family(
     neighbours: np.ndarray,
     neighbour_mask: np.ndarray,
     boundary_patch_mask: np.ndarray,
+    poincare_constants: np.ndarray,
 ) -> MeshfreePatchFamily:
     """
-    Validate a patch family and derive its padding, diameters, and index split.
+    Validate a planar patch family and derive its padding, diameters, areas,
+    and index split.
 
     Parameters
     ----------
@@ -126,6 +147,9 @@ def create_meshfree_patch_family(
         ``True`` for real neighbours, shape ``(N_patch, C)``.
     boundary_patch_mask : np.ndarray
         ``True`` for the boundary patches, shape ``(N_patch,)``.
+    poincare_constants : np.ndarray
+        Constant ``c_2(P_i)`` of inequality (W2) of each patch, shape
+        ``(N_patch,)``.
 
     Returns
     -------
@@ -136,8 +160,8 @@ def create_meshfree_patch_family(
     Raises
     ------
     ValueError
-        If a patch has no triangle or does not list itself as its first
-        neighbour.
+        If a patch has no triangle, does not list itself as its first
+        neighbour, or has a constant ``c_2`` that is not positive.
     """
     number_of_patches = centres.shape[-2]
     triangle_mask = np.asarray(triangle_mask, dtype=bool)
@@ -150,6 +174,14 @@ def create_meshfree_patch_family(
         and np.array_equal(neighbours[:, 0], np.arange(number_of_patches))
     ):
         raise ValueError("Every patch must list itself as its first neighbour.")
+    poincare_constants = np.asarray(poincare_constants, dtype=float)
+    if poincare_constants.shape != (number_of_patches,) or not np.all(
+        poincare_constants > 0.0
+    ):
+        raise ValueError(
+            f"poincare_constants must be positive with shape ({number_of_patches},), "
+            f"got shape {poincare_constants.shape}."
+        )
 
     first_triangles = np.take_along_axis(
         local_triangles,
@@ -166,6 +198,10 @@ def create_meshfree_patch_family(
     patch_diameters = np.sqrt(
         np.max(np.sum(differences**2, axis=-1), axis=(-1, -2, -3, -4))
     )
+    edges = local_triangles[..., 1:, :] - local_triangles[..., :1, :]
+    patch_areas = np.sum(
+        np.where(triangle_mask, 0.5 * np.abs(np.linalg.det(edges)), 0.0), axis=-1
+    )
     boundary_patch_mask = np.asarray(boundary_patch_mask, dtype=bool)
     return MeshfreePatchFamily(
         weight=weight,
@@ -176,6 +212,8 @@ def create_meshfree_patch_family(
         neighbours=jnp.asarray(neighbours, dtype=jnp.int32),
         neighbour_mask=jnp.asarray(neighbour_mask),
         patch_diameters=jnp.asarray(patch_diameters),
+        patch_areas=jnp.asarray(patch_areas),
+        poincare_constants=jnp.asarray(poincare_constants),
         boundary_patch_mask=jnp.asarray(boundary_patch_mask),
         interior_patches=jnp.flatnonzero(jnp.asarray(~boundary_patch_mask)),
     )
@@ -422,4 +460,57 @@ def create_meshfree_patch_test_space(
         raw_weights=_own_functions(neighbour_weights),
         gram=gram,
         covering_bounds=(float(jnp.min(sums)), float(jnp.max(sums))),
+    )
+
+
+def subdivide_meshfree_family(
+    family: MeshfreePatchFamily, levels: int
+) -> MeshfreePatchFamily:
+    """
+    The same family with every local triangle split into ``4^levels`` triangles.
+
+    Parameters
+    ----------
+    family : MeshfreePatchFamily
+        Planar patch family.
+    levels : int
+        Number of uniform splits, at least zero; each joins the midpoints of
+        the edges of every triangle.
+
+    Returns
+    -------
+    family : MeshfreePatchFamily
+        The family with the split local triangles; the patches, weights,
+        neighbours, diameters, areas and constants are unchanged.
+
+    Notes
+    -----
+    Every weight is smooth on the original local triangles, hence on the new
+    ones, so a rule applied on the new triangles is a composite rule on the
+    original ones. It converges for the rational normalised weights as the
+    triangles shrink, and gives reference values for the quadrature error
+    of the rule on the original triangles.
+    """
+    if levels < 0:
+        raise ValueError(f"levels must be non-negative, got {levels}.")
+    triangles = np.asarray(family.local_triangles)
+    mask = np.asarray(family.triangle_mask)
+    for _ in range(levels):
+        a, b, c = triangles[..., 0, :], triangles[..., 1, :], triangles[..., 2, :]
+        ab, bc, ca = 0.5 * (a + b), 0.5 * (b + c), 0.5 * (c + a)
+        children = np.stack(
+            [
+                np.stack(vertices, axis=-2)
+                for vertices in ((a, ab, ca), (ab, b, bc), (ca, bc, c), (ab, bc, ca))
+            ],
+            axis=-3,
+        )
+        triangles = np.reshape(
+            children, triangles.shape[:-3] + (-1,) + triangles.shape[-2:]
+        )
+        mask = np.repeat(mask, 4, axis=-1)
+    return dataclasses.replace(
+        family,
+        local_triangles=jnp.asarray(triangles),
+        triangle_mask=jnp.asarray(mask),
     )

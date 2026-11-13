@@ -30,6 +30,7 @@ from vpinns_jax.test_spaces import (
     create_meshfree_patch_test_space,
     create_patch_test_space,
     create_vertex_star_family,
+    subdivide_meshfree_family,
 )
 
 _CELLS_PER_SIDE = 4
@@ -77,17 +78,47 @@ def test_crisscross_family_configurations(problem) -> None:
     integrals = _weight_integrals(space) / _SPACING**2
     assert np.allclose(integrals[:grid_points], np.array([2.0, 1.0, 0.5])[sides] / 3)
     assert np.allclose(integrals[grid_points:], 1.0 / 3.0)
+    areas = np.asarray(family.patch_areas) / _SPACING**2
+    assert np.allclose(areas[:grid_points], np.array([2.0, 1.0, 0.5])[sides])
+    assert np.allclose(areas[grid_points:], 1.0)
+    # c_2 h = diam / pi of the full diamond for the grid points, of the cell else.
+    constants = np.asarray(family.poincare_constants) * np.pi
+    assert np.allclose(
+        constants[:grid_points], np.array([1.0, 1.0, np.sqrt(2.0)])[sides]
+    )
+    assert np.allclose(constants[grid_points:], 1.0)
+
+
+# c_2 h / s of the interior, side and corner patches: the bilinear family keeps
+# the a priori diam / pi of the reflected square, the l^inf family uses the
+# eigenvalue problems, rounded up.
+_BILINEAR_LENGTHS = (2.0 * np.sqrt(2.0) / np.pi,) * 3
+_LINF_LENGTHS = (0.470, 0.470, 0.361)
 
 
 @pytest.mark.parametrize(
-    ("create_family", "expected_integrals", "expected_covering_bounds"),
+    (
+        "create_family",
+        "expected_integrals",
+        "expected_covering_bounds",
+        "expected_lengths",
+    ),
     [
-        (create_bilinear_family, (1.0, 0.5, 0.25), (1.0, 1.0)),
-        (create_linf_vertex_family, (4.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0), (1.0, 2.0)),
+        (create_bilinear_family, (1.0, 0.5, 0.25), (1.0, 1.0), _BILINEAR_LENGTHS),
+        (
+            create_linf_vertex_family,
+            (4.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0),
+            (1.0, 2.0),
+            _LINF_LENGTHS,
+        ),
     ],
 )
 def test_grid_point_family_configurations(
-    create_family, expected_integrals, expected_covering_bounds, problem
+    create_family,
+    expected_integrals,
+    expected_covering_bounds,
+    expected_lengths,
+    problem,
 ) -> None:
     n = _CELLS_PER_SIDE
     family = create_family(n)
@@ -105,6 +136,13 @@ def test_grid_point_family_configurations(
     )
     assert np.allclose(
         _weight_integrals(space), _SPACING**2 * np.array(expected_integrals)[sides]
+    )
+    assert np.allclose(
+        family.patch_areas, _SPACING**2 * np.array([4.0, 2.0, 1.0])[sides]
+    )
+    assert np.allclose(
+        family.poincare_constants * family.patch_diameters,
+        _SPACING * np.array(expected_lengths)[sides],
     )
 
 
@@ -190,11 +228,14 @@ def _compare_with_mesh_based_space(
         compute_meshfree_patch_residual(meshfree_space, meshfree_trial),
         compute_patch_residual(mesh_space, mesh_trial),
     )
+    # The mesh-based terms leave out the constants c_2 of (W2).
+    constants = jnp.expand_dims(meshfree_space.family.poincare_constants, axis=-1)
     assert jnp.allclose(
         compute_meshfree_patch_residual_terms(
             meshfree_space, meshfree_trial, meshfree_divergence
         ),
-        compute_patch_residual_terms(mesh_space, mesh_trial, mesh_divergence),
+        constants**2
+        * compute_patch_residual_terms(mesh_space, mesh_trial, mesh_divergence),
     )
 
 
@@ -273,6 +314,30 @@ def test_exact_solution_has_vanishing_residual_terms(
     )
 
 
+def test_residual_terms_are_the_weighted_strong_residuals(problem) -> None:
+    """An affine trial has strong residual f, so rho_i^2 = c_2^2 h_i^2 (phi_i, f^2)."""
+    space = create_meshfree_patch_test_space(
+        create_linf_vertex_family(_CELLS_PER_SIDE), problem, normalise=True
+    )
+
+    def affine(x: jnp.ndarray) -> jnp.ndarray:
+        return 1.0 + 2.0 * x[0] - 0.5 * x[1]
+
+    terms = compute_meshfree_patch_residual_terms(
+        space,
+        evaluate_network(affine, space.points),
+        evaluate_network_flux_divergence(affine, problem.diffusion, space.points),
+    )
+    weighted_source = integrate_cellwise(
+        space.raw_weights.values * space.coefficients.source**2, space.weights
+    )[:, 0, 0, 0]
+    family = space.family
+    expected = (family.poincare_constants * family.patch_diameters) ** 2 * (
+        weighted_source
+    )
+    assert jnp.allclose(terms[:, 0], expected, rtol=1e-12)
+
+
 def test_meshfree_patch_loss_inside_jit_matches_eager(problem, prng_key) -> None:
     space = create_meshfree_patch_test_space(create_crisscross_family(3), problem)
     interior = space.family.interior_patches
@@ -295,3 +360,27 @@ def test_meshfree_patch_loss_inside_jit_matches_eager(problem, prng_key) -> None
     assert jnp.allclose(eqx.filter_jit(loss_fn)(network), loss_fn(network))
     gradient = eqx.filter_grad(loss_fn)(network)
     assert jnp.all(jnp.isfinite(gradient.net.layers[0].weight))
+
+
+def test_subdivided_family_keeps_the_patches_and_refines_the_rule(problem) -> None:
+    """The split triangles tile each patch, and a composite rule agrees."""
+    family = create_linf_vertex_family(_CELLS_PER_SIDE)
+    subdivided = subdivide_meshfree_family(family, 2)
+    triangles = np.asarray(subdivided.local_triangles)
+    areas = 0.5 * np.abs(np.linalg.det(triangles[..., 1:, :] - triangles[..., :1, :]))
+    coarse = create_meshfree_patch_test_space(
+        family, problem, quadrature_degree=8, normalise=True
+    )
+    fine = create_meshfree_patch_test_space(
+        subdivided, problem, quadrature_degree=8, normalise=True
+    )
+
+    assert triangles.shape[-3] == 16 * family.local_triangles.shape[-3]
+    assert np.allclose(
+        np.sum(np.where(subdivided.triangle_mask, areas, 0.0), axis=-1),
+        family.patch_areas,
+    )
+    assert np.allclose(_weight_integrals(fine), _weight_integrals(coarse), rtol=1e-12)
+    gram = np.asarray(restrict_to_free(coarse.gram, family.interior_patches))
+    reference = np.asarray(restrict_to_free(fine.gram, family.interior_patches))
+    assert np.allclose(gram, reference, rtol=1e-3, atol=1e-6)

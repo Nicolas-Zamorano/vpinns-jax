@@ -13,6 +13,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
+from tqdm import tqdm
 
 #: A function of the model evaluated during training, returning a pytree of
 #: scalars, e.g. from ``vpinns_jax.analysis.create_training_monitor``.
@@ -43,6 +44,34 @@ class TrainingHistory:
     monitored: Any = None
 
 
+# Monitor fields shown on the progress bar, with their labels.
+_PROGRESS_FIELDS = (("relative_energy_error", "rel. error"), ("robustness", "ratio"))
+
+
+def _progress_fields(record: Any) -> dict[str, str]:
+    """
+    Monitor values shown on the progress bar.
+
+    Parameters
+    ----------
+    record : Any
+        Monitor output.
+
+    Returns
+    -------
+    fields : dict[str, str]
+        The relative energy error and the ratio ``sqrt(L) / |u - w|_A`` of a
+        record with the ``relative_energy_error`` and ``robustness`` fields,
+        such as a ``TrainingRecord``, by label; the fields it lacks are left
+        out.
+    """
+    return {
+        label: f"{float(getattr(record, name)):.3e}"
+        for name, label in _PROGRESS_FIELDS
+        if hasattr(record, name)
+    }
+
+
 def _run_steps(
     step: Callable[[Any], tuple[Any, jax.Array]],
     carry: Any,
@@ -53,6 +82,7 @@ def _run_steps(
     early_stopping_min_delta: float,
     monitor: Callable[[Any], Any] | None,
     monitor_every: int,
+    description: str,
 ) -> tuple[Any, TrainingHistory]:
     """
     Apply a training step repeatedly and record the loss and the monitor.
@@ -66,8 +96,8 @@ def _run_steps(
     num_steps : int
         Maximum number of steps, at least one.
     log_every : int | None
-        Print the loss every this many steps and at the last step; ``None``
-        disables printing.
+        Show a progress bar whose loss is updated every this many steps and
+        at the last step; ``0`` or ``None`` hides it.
     early_stopping_patience : int | None
         Stop after this many consecutive steps without improvement; ``None``
         disables early stopping.
@@ -78,6 +108,8 @@ def _run_steps(
         the last step; ``None`` disables monitoring.
     monitor_every : int
         Number of steps between monitor evaluations, at least one.
+    description : str
+        Label of the progress bar.
 
     Returns
     -------
@@ -88,39 +120,64 @@ def _run_steps(
 
     Notes
     -----
-    Early stopping and printing read the loss on the host, which
-    synchronizes every step; without them the steps are dispatched
+    The progress bar shows the loss and, if the monitor returns records with
+    the ``relative_energy_error`` and ``robustness`` fields, such as those of
+    ``vpinns_jax.analysis.create_training_monitor``, the relative energy error
+    and the ratio ``sqrt(L) / |u - w|_A`` of the latest record.
+
+    Early stopping and the loss on the progress bar are read on the host,
+    which synchronizes at those steps; without them the steps are dispatched
     asynchronously.
     """
     if num_steps < 1:
         raise ValueError(f"num_steps must be at least 1, got {num_steps}.")
     if monitor_every < 1:
         raise ValueError(f"monitor_every must be at least 1, got {monitor_every}.")
+    if log_every is not None and log_every < 0:
+        raise ValueError(f"log_every must be non-negative, got {log_every}.")
+    show_progress = bool(log_every)
     losses = []
     records = []
     recorded_steps = []
+    monitored = {}
     best_loss = math.inf
     steps_without_improvement = 0
-    for index in range(num_steps):
-        if monitor is not None and index % monitor_every == 0:
-            records.append(monitor(carry))
-            recorded_steps.append(index)
-        carry, loss = step(carry)
-        losses.append(loss)
-        if log_every is not None and (index % log_every == 0 or index == num_steps - 1):
-            print(f"  step {index:6d}  loss {float(loss):.6e}")
-        if early_stopping_patience is not None:
-            if float(loss) < best_loss - early_stopping_min_delta:
-                best_loss = float(loss)
-                steps_without_improvement = 0
-            else:
-                steps_without_improvement += 1
-                if steps_without_improvement >= early_stopping_patience:
-                    break
-    if monitor is None:
-        return carry, TrainingHistory(loss=jnp.stack(losses))
-    records.append(monitor(carry))
-    recorded_steps.append(len(losses))
+    with tqdm(
+        total=num_steps,
+        desc=description,
+        unit="step",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    ) as progress:
+        for index in range(num_steps):
+            if monitor is not None and index % monitor_every == 0:
+                records.append(monitor(carry))
+                recorded_steps.append(index)
+                if show_progress:
+                    monitored = _progress_fields(records[-1])
+            carry, loss = step(carry)
+            losses.append(loss)
+            progress.update()
+            if show_progress and (index % log_every == 0 or index == num_steps - 1):
+                progress.set_postfix(
+                    {"loss": f"{float(loss):.3e}", **monitored}, refresh=False
+                )
+            if early_stopping_patience is not None:
+                if float(loss) < best_loss - early_stopping_min_delta:
+                    best_loss = float(loss)
+                    steps_without_improvement = 0
+                else:
+                    steps_without_improvement += 1
+                    if steps_without_improvement >= early_stopping_patience:
+                        break
+        if monitor is None:
+            return carry, TrainingHistory(loss=jnp.stack(losses))
+        records.append(monitor(carry))
+        recorded_steps.append(len(losses))
+        if show_progress:
+            progress.set_postfix(
+                {"loss": f"{float(losses[-1]):.3e}", **_progress_fields(records[-1])}
+            )
     return carry, TrainingHistory(
         loss=jnp.stack(losses),
         monitored_steps=jnp.asarray(recorded_steps),
@@ -209,12 +266,54 @@ def _train(
     return eqx.combine(parameters, static), history
 
 
+def _adam_learning_rate(
+    learning_rate: float, final_learning_rate: float | None, num_steps: int
+) -> float | optax.Schedule:
+    """
+    Constant or exponentially decaying Adam learning rate.
+
+    Parameters
+    ----------
+    learning_rate : float
+        Learning rate, or its initial value.
+    final_learning_rate : float | None
+        Learning rate after ``num_steps`` steps; ``None`` keeps it constant.
+    num_steps : int
+        Number of steps of the decay.
+
+    Returns
+    -------
+    learning_rate : float | optax.Schedule
+        ``learning_rate``, or the schedule
+        ``k -> learning_rate (final_learning_rate / learning_rate)^(k / num_steps)``.
+
+    Raises
+    ------
+    ValueError
+        If a learning rate is not positive.
+    """
+    if learning_rate <= 0.0:
+        raise ValueError(f"learning_rate must be positive, got {learning_rate}.")
+    if final_learning_rate is None:
+        return learning_rate
+    if final_learning_rate <= 0.0:
+        raise ValueError(
+            f"final_learning_rate must be positive, got {final_learning_rate}."
+        )
+    return optax.exponential_decay(
+        init_value=learning_rate,
+        transition_steps=max(num_steps, 1),
+        decay_rate=final_learning_rate / learning_rate,
+    )
+
+
 def train_adam(
     loss_fn: Callable[[eqx.Module], jax.Array],
     model: eqx.Module,
     *,
     num_steps: int,
     learning_rate: float = 1e-3,
+    final_learning_rate: float | None = None,
     log_every: int | None = None,
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 0.0,
@@ -234,9 +333,16 @@ def train_adam(
     num_steps : int
         Maximum number of steps.
     learning_rate : float
-        Adam learning rate.
+        Adam learning rate, or its initial value with ``final_learning_rate``.
+    final_learning_rate : float | None
+        Learning rate reached after ``num_steps`` steps, from
+        ``learning_rate`` by exponential decay; ``None`` keeps the learning
+        rate constant.
     log_every : int | None
-        Print the loss every this many steps; ``None`` disables printing.
+        Show a progress bar whose loss is updated every this many steps,
+        with the relative energy error and the ratio ``sqrt(L) / |u - w|_A``
+        of the latest record of a ``create_training_monitor`` monitor; ``0``
+        or ``None`` hides it.
     early_stopping_patience : int | None
         Stop after this many consecutive steps without improvement; ``None``
         disables early stopping.
@@ -254,8 +360,15 @@ def train_adam(
         Trained model.
     history : TrainingHistory
         Loss of every step taken and the monitor records.
+
+    Notes
+    -----
+    With ``final_learning_rate``, step ``k`` uses the learning rate
+    ``learning_rate (final_learning_rate / learning_rate)^(k / num_steps)``.
     """
-    optimizer = optax.adam(learning_rate)
+    optimizer = optax.adam(
+        _adam_learning_rate(learning_rate, final_learning_rate, num_steps)
+    )
 
     def create_step(
         objective: Callable[[eqx.Module], jax.Array],
@@ -312,6 +425,7 @@ def train_adam(
         early_stopping_min_delta=early_stopping_min_delta,
         monitor=monitor,
         monitor_every=monitor_every,
+        description="Adam",
     )
 
 
@@ -342,7 +456,10 @@ def train_lbfgs(
     memory_size : int
         Number of past updates kept for the curvature approximation.
     log_every : int | None
-        Print the loss every this many steps; ``None`` disables printing.
+        Show a progress bar whose loss is updated every this many steps,
+        with the relative energy error and the ratio ``sqrt(L) / |u - w|_A``
+        of the latest record of a ``create_training_monitor`` monitor; ``0``
+        or ``None`` hides it.
     early_stopping_patience : int | None
         Stop after this many consecutive steps without improvement; ``None``
         disables early stopping.
@@ -432,6 +549,7 @@ def train_lbfgs(
         early_stopping_min_delta=early_stopping_min_delta,
         monitor=monitor,
         monitor_every=monitor_every,
+        description="L-BFGS",
     )
 
 
@@ -478,6 +596,7 @@ def train(
     *,
     adam_steps: int,
     adam_learning_rate: float = 1e-3,
+    adam_final_learning_rate: float | None = None,
     lbfgs_steps: int = 0,
     log_every: int | None = None,
     monitor: Monitor | None = None,
@@ -495,11 +614,18 @@ def train(
     adam_steps : int
         Number of Adam steps.
     adam_learning_rate : float
-        Adam learning rate.
+        Adam learning rate, or its initial value with
+        ``adam_final_learning_rate``.
+    adam_final_learning_rate : float | None
+        Adam learning rate after ``adam_steps`` steps, reached by exponential
+        decay; ``None`` keeps it constant.
     lbfgs_steps : int
         Number of L-BFGS steps after Adam; none if ``0``.
     log_every : int | None
-        Print the loss every this many steps; ``None`` disables printing.
+        Show a progress bar whose loss is updated every this many steps,
+        with the relative energy error and the ratio ``sqrt(L) / |u - w|_A``
+        of the latest record of a ``create_training_monitor`` monitor; ``0``
+        or ``None`` hides it.
     monitor : Monitor | None
         Function of the model recorded during both stages; ``None`` disables
         monitoring.
@@ -519,6 +645,7 @@ def train(
         model,
         num_steps=adam_steps,
         learning_rate=adam_learning_rate,
+        final_learning_rate=adam_final_learning_rate,
         log_every=log_every,
         monitor=monitor,
         monitor_every=monitor_every,

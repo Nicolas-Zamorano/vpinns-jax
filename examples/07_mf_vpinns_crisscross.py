@@ -5,9 +5,13 @@ The patches are the diamonds ``|x - z|_1 < s`` at the grid points and the cells
 domain, with weights ``1 - |x - z|_1 / s`` and ``1 - 2 |x - m|_inf / s``. The
 weights sum to one, so the test functions are the raw weights of the interior
 patches, without normalisation. Every patch is integrated on its own triangles
-with the degree-2 rule; no global mesh is built. The trial function is a
-network with the homogeneous Dirichlet condition imposed by the ansatz
-``w = B u_theta``, for the Poisson problem with solution sin(pi x) sin(pi y).
+with the degree-4 rule; no global mesh is built. The problem is the
+advection-diffusion-reaction problem ``-div(A grad u) + beta . grad u + c u = f``
+of ``create_simple_elliptic_problem``, with variable coefficients and
+nonhomogeneous Dirichlet data ``g``. The trial function is a network with the
+Dirichlet condition imposed by the ansatz ``w = B u_theta + g_bar``, where
+``B = x (1 - x) y (1 - y)`` and the lift ``g_bar`` is the transfinite
+interpolation of ``g`` into the square, so ``w = g`` on the boundary.
 Four losses are compared, every combination of a dual norm of the residual
 with or without the residual terms:
 
@@ -19,7 +23,8 @@ with or without the residual terms:
 - coupled_estimator: ``eta_P^2 + lambda sum_i eta_R,i^2``;
 
 where the residual terms are the weighted strong residuals
-``eta_R,i = h_i ||phi_i^(1/2) (f + lap w)||``.
+``eta_R,i = rho_i = c_2(P_i) h_i ||phi_i^(1/2) (f + div(A grad w)
+- beta . grad w - c w)||``, with the constants ``c_2(P_i)`` of the family.
 
 For every trained network the script prints the errors, the three estimator
 terms, and the ratios of ``eta_P`` and of both estimators,
@@ -51,7 +56,7 @@ from jax_fem.diagnostics import (
 )
 from jax_fem.element import LagrangeTriangleP1
 from jax_fem.mesh import create_gmsh_unit_square_mesh
-from jax_fem.problem import create_poisson_sin_sin_problem
+from jax_fem.problem import create_simple_elliptic_problem
 from jax_fem.reference_cell import ReferenceTriangle
 from jax_fem.space import create_cell_basis, create_finite_element_space
 
@@ -75,6 +80,7 @@ from vpinns_jax.models import (
     ConstrainedAnsatz,
     ExactDistanceFunction,
     MultiLayerPerceptron,
+    TransfiniteLift,
     evaluate_network,
     evaluate_network_flux_divergence,
 )
@@ -83,6 +89,10 @@ from vpinns_jax.test_spaces import (
     create_crisscross_family,
     create_meshfree_patch_test_space,
 )
+
+# The energy norm of this problem is not that of the Poisson problem.
+_ERROR_NORM = r"\|u - u_\theta\|_A"
+_SOLUTION_NORM = r"\|u\|_A"
 
 
 class SquaredTerms(NamedTuple):
@@ -112,7 +122,7 @@ def main(
     learning_rate: float = 1e-3,
     residual_weight: float = 1.0,
     seed: int = 0,
-    quadrature_degree: int = 2,
+    quadrature_degree: int = 4,
     error_cells_per_side: int = 64,
     error_quadrature_degree: int = 4,
 ) -> None:
@@ -148,9 +158,9 @@ def main(
         create_finite_element_space(error_mesh, element),
         element.reference_cell.create_quadrature(error_quadrature_degree),
     )
-    # The mesh only defines the problem's Dirichlet data; the patch space uses
-    # its coefficient functions.
-    problem = create_poisson_sin_sin_problem(error_mesh)
+    # The mesh only tags the boundary of the problem's Dirichlet condition; the
+    # patch space uses the coefficient functions and the lift the data.
+    problem = create_simple_elliptic_problem(error_mesh)
     l2_norm = compute_solution_norm(error_basis, problem, l2_error_functional)
     energy_norm = compute_solution_norm(error_basis, problem, energy_error_functional)
 
@@ -164,6 +174,8 @@ def main(
     diagonal = jnp.diagonal(gram)
     points = space.points
     distance = ExactDistanceFunction("unit_square")
+    (dirichlet_condition,) = problem.dirichlet_conditions
+    lift = TransfiniteLift(dirichlet_condition.value)
 
     def squared_terms(model: eqx.Module) -> SquaredTerms:
         """
@@ -179,7 +191,7 @@ def main(
         terms : SquaredTerms
             ``eta_P^2``, ``eta_D^2``, and ``sum_i eta_R,i^2``.
         """
-        trial_network = ConstrainedAnsatz(model, distance)
+        trial_network = ConstrainedAnsatz(model, distance, lift)
         trial = evaluate_network(trial_network, points)
         residual = jnp.take(
             compute_meshfree_patch_residual(space, trial), interior, axis=-2
@@ -216,10 +228,10 @@ def main(
         if loss_name.startswith("decoupled"):
             dual_norm = {r"$\eta_D^2$": terms.decoupled}
         else:
-            dual_norm = {r"$\eta_P^2$": terms.coupled}
+            dual_norm = {r"$\eta_{\mathcal{P}}^2$": terms.coupled}
         if loss_name.endswith("estimator"):
             residual = residual_weight * terms.residual
-            return dual_norm | {r"$\lambda \sum_i \eta_{R,i}^2$": residual}
+            return dual_norm | {r"$\lambda \rho^2$": residual}
         return dual_norm
 
     def energy_error(model: eqx.Module) -> jax.Array:
@@ -237,7 +249,7 @@ def main(
             ``|u - w|_A``, shape ``()``.
         """
         return compute_network_error(
-            ConstrainedAnsatz(model, distance),
+            ConstrainedAnsatz(model, distance, lift),
             error_basis,
             problem,
             energy_error_functional,
@@ -248,7 +260,7 @@ def main(
     )
 
     print(
-        f"MF-VPINN, Poisson sin-sin, criss-cross patches on a "
+        f"MF-VPINN, simple elliptic problem, criss-cross patches on a "
         f"{cells_per_side}x{cells_per_side} grid: {family.number_of_patches} "
         f"patches, {interior.shape[-1]} test functions, covering bounds "
         f"(c_U2, c_U1) = {space.covering_bounds}."
@@ -310,7 +322,7 @@ def main(
         )
         elapsed = time.perf_counter() - start
 
-        trial_network = ConstrainedAnsatz(network, distance)
+        trial_network = ConstrainedAnsatz(network, distance, lift)
         l2 = compute_network_error(
             trial_network, error_basis, problem, l2_error_functional
         )
@@ -332,9 +344,11 @@ def main(
         )
 
         figures = {
-            "training": plot_training_quantities(history),
+            "training": plot_training_quantities(
+                history, error_norm=_ERROR_NORM, solution_norm=_SOLUTION_NORM
+            ),
             "loss_terms": plot_loss_terms(history),
-            "robustness": plot_robustness(history),
+            "robustness": plot_robustness(history, error_norm=_ERROR_NORM),
             "solution": plot_network_solution(trial_network, error_mesh, problem),
         }
         for name, figure in figures.items():
